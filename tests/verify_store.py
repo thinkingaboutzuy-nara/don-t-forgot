@@ -104,8 +104,27 @@ CHECKS = r'''
         let prompt = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "prompt" }?.value ?? ""
         expect(url.host == "threads" && url.path == "/new", "codex new-thread link")
         expect(prompt.contains("事项 ID：h&1") && prompt.contains("核对 A+B=C"), "prompt survives encoding")
+        // Report platform link: the later of platform change and manual action wins
+        store.now = parseDate("2026-10-21T17:00:00+08:00")!
+        var linked = task("r", "resolved", resolution: "日报平台已勾选")
+        linked.reportTodo = ReportTodo(id: "t1", version: 4, done: true, reportId: nil, workDate: nil, changedAt: "2026-10-21T08:00:00Z")
+        store.actions = ["r": LocalAction(status: "active", until: nil, updatedAt: "2026-10-21T07:00:00Z")]
+        expect(store.status(linked) == "done", "platform tick newer than manual restore wins")
+        store.actions = ["r": LocalAction(status: "active", until: nil, updatedAt: "2026-10-21T08:30:00Z")]
+        expect(store.status(linked) == "active", "manual restore newer than platform tick wins")
+        expect(Source(chat: "工作汇报", time: "2026-10-19", quote: "q", messageId: "todo:t1", conversationId: "report:x", conversationType: "report").directionText == "日报待办", "report source label")
+        // Daily report hand-off lists today's completions with reasons
+        store.inbox.tasks = [task("a", "action", title: "交付周报"), task("b", "action", title: "核对编码"), task("c", "action", title: "昨天的事")]
+        store.actions = ["a": LocalAction(status: "done", until: nil, updatedAt: "2026-10-21T08:10:00Z", reason: "办完了", note: "已发群里"),
+                         "b": LocalAction(status: "done", until: nil, updatedAt: "2026-10-21T08:20:00Z", reason: "对方已处理"),
+                         "c": LocalAction(status: "done", until: nil, updatedAt: "2026-10-20T08:00:00Z", reason: "办完了")]
+        expect(store.completedToday.map(\.id) == ["b", "a"], "completed today, newest first \(store.completedToday.map(\.id))")
+        let report = store.reportPrompt()
+        expect(report.contains("2026-10-21") && report.contains("交付周报") && report.contains("备注：已发群里") && !report.contains("昨天的事"), "report prompt content")
+        expect(report.contains("submit_report") && report.contains("工时不要猜"), "report prompt boundaries")
+        expect(store.reportURL?.absoluteString.hasPrefix("codex://threads/new?prompt=") == true, "report link")
         if failed > 0 { exit(1) }
-        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link")
+        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link and daily report")
     }
 }
 '''

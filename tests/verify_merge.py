@@ -118,6 +118,24 @@ def verify(script):
         assert 'closedAt' not in row and not inbox['archived']
         assert (root / 'actions.json').read_bytes() == json.dumps(actions).encode()
 
+    # Report platform link: pending ticks, platform-newer wins, validation
+    with tempfile.TemporaryDirectory(prefix='todo-merge-report-') as tmp:
+        root = pathlib.Path(tmp)
+        linked = copy.deepcopy(task)
+        linked.update(id='report-todo-t1', title='日报待办：核对验收', reportTodo={'id': 't1', 'version': 2, 'done': False})
+        module.merge(root, {'tasks': [linked]})
+        (root / 'actions.json').write_text(json.dumps({'report-todo-t1': {'status': 'done', 'reason': '办完了', 'updatedAt': '2026-10-21T08:00:00Z'}}))
+        sync = module.open_view(root)['reportSync']
+        assert sync == [{'id': 'report-todo-t1', 'todoId': 't1', 'expectedVersion': 2, 'done': True, 'at': '2026-10-21T08:00:00Z'}], sync
+        # The platform was unticked later on the web: no push, and the task is open again.
+        linked['reportTodo'] = {'id': 't1', 'version': 3, 'done': False, 'changedAt': '2026-10-21T09:00:00Z'}
+        module.merge(root, {'tasks': [linked]})
+        view = module.open_view(root)
+        assert view['reportSync'] == [] and [t['id'] for t in view['open']] == ['report-todo-t1'], view
+        bad = copy.deepcopy(linked)
+        bad['reportTodo'] = {'id': 't1', 'version': '3', 'done': False}
+        rejected(module, root, {'tasks': [bad]}, 'reportTodo version 类型')
+
     # Validation must not depend on assert statements
     with tempfile.TemporaryDirectory(prefix='todo-merge-O-') as tmp:
         bad = copy.deepcopy(payload)
@@ -127,7 +145,7 @@ def verify(script):
         run = subprocess.run([sys.executable, '-O', str(script), '--data-dir', tmp, '--input', str(delta)],
                              capture_output=True, text=True)
         assert run.returncode != 0 and '增量被拒绝' in run.stderr, run
-    print('PASS: stable ID, manual actions, failed coverage, atomic rejection, stale, open view, archive, python -O')
+    print('PASS: stable ID, manual actions, failed coverage, atomic rejection, stale, open view, archive, report sync, python -O')
 
 
 if __name__ == '__main__':

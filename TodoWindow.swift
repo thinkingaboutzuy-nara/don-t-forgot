@@ -50,6 +50,7 @@ struct Source: Codable, Hashable {
     var conversationType: String?
     var directionText: String {
         if conversationType == "system" || conversationId == "todo" { return "系统待办记录" }
+        if conversationType == "report" { return "日报待办" }
         guard let senderName, !senderName.isEmpty else { return "发送人未确认" }
         guard let recipientName, !recipientName.isEmpty else { return "\(senderName) · 接收对象未确认" }
         return "\(senderName) → \(recipientName)"
@@ -59,6 +60,15 @@ struct Dispatch: Codable, Hashable {
     var threadId: String?
     var title: String?
     var status: String?
+}
+/// Link to a todo in the work-report platform. `changedAt` is when整理 last saw the platform flip it.
+struct ReportTodo: Codable, Hashable {
+    var id: String
+    var version: Int
+    var done: Bool
+    var reportId: String?
+    var workDate: String?
+    var changedAt: String?
 }
 struct Todo: Codable, Identifiable {
     var id: String
@@ -75,6 +85,7 @@ struct Todo: Codable, Identifiable {
     var firstSeen: String?
     var lastSeen: String?
     var closedAt: String?
+    var reportTodo: ReportTodo?
     static let confirmPrefixes = ["待确认：", "待确认:", "待确认 "]
     var isUnconfirmed: Bool { needsConfirm ?? title.hasPrefix("待确认") }
     var displayTitle: String {
@@ -211,6 +222,8 @@ func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
     func status(_ todo: Todo) -> String {
         guard let a = actions[todo.id], let s = a.status else { return automatic(todo) }
         if s == "snoozed" { return (a.until ?? 0) > now.timeIntervalSince1970 ? "snoozed" : automatic(todo) }
+        // A tick or untick made on the report platform after this manual action wins.
+        if let changed = parseDate(todo.reportTodo?.changedAt), let acted = parseDate(a.updatedAt), changed > acted { return automatic(todo) }
         return s
     }
     func isArchived(_ todo: Todo) -> Bool { ["done", "dismissed"].contains(status(todo)) }
@@ -347,11 +360,43 @@ func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
         lines += ["", "先核对相关项目和已有 Codex 对话，避免重复做；能直接推进的就推进。发布、对外发消息、修改正式数据之前先问我。做完告诉我完成依据。"]
         return lines.joined(separator: "\n")
     }
-    func handoffURL(_ todo: Todo) -> URL? {
-        var allowed = CharacterSet.alphanumerics; allowed.insert(charactersIn: "-._~")
-        guard let prompt = handoffPrompt(todo).addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
-        return URL(string: "codex://threads/new?prompt=" + prompt)
+    func handoffURL(_ todo: Todo) -> URL? { codexNewThreadURL(handoffPrompt(todo)) }
+
+    // MARK: Daily report
+    /// Everything that became done today, by the user or by整理, newest first.
+    var completedToday: [Todo] {
+        items(2).filter { status($0) == "done" && closedDate($0).map { appCalendar.isDate($0, inSameDayAs: now) } == true }
     }
+    func reportPrompt() -> String {
+        let day = dateText(now, format: "yyyy-MM-dd")
+        var lines = ["请用 work-reports MCP 整理我 \(dateText(now, format: "M月d日"))（\(day)）的日报。", ""]
+        let done = completedToday
+        if done.isEmpty {
+            lines.append("今天在「别忘了」还没有标记完成的事。请先读取今天日报的现状，再问我今天做了什么。")
+        } else {
+            lines.append("今天在「别忘了」完成的事：")
+            for (i, t) in done.enumerated() {
+                let a = actions[t.id]
+                var line = "\(i + 1). \(t.displayTitle)（事项 ID：\(t.id)）"
+                if let r = t.reportTodo { line += "［日报待办 \(r.id)，平台\(r.done ? "已" : "未")勾选，version \(r.version)］" }
+                if let a, a.status == "done" {
+                    line += " — 我选的理由：\(a.reason ?? "未记录")"
+                    if let note = a.note { line += "；备注：\(note)" }
+                } else if let r = t.resolution {
+                    line += " — 整理时确认完成：\(r.prefix(160))"
+                }
+                lines.append(line)
+            }
+        }
+        lines += ["", "要求：",
+                  "- 先 get_reporting_context，再用 search_reports 查今天是否已有日报；已有就在原报告上用 save_report_draft 按新事项 ID 追加，不改动已有事项。",
+                  "- 默认只写理由为“办完了”或整理确认完成、且是我本人做的工作；“对方已处理”“不用做了”的先列出来问我要不要写。",
+                  "- 工时不要猜，留空让我填；项目只在 search_projects 能唯一对应时才带上，否则留空并告诉我。",
+                  "- 先保存草稿，把事项和缺项给我看。我明确说“提交”后再 submit_report，并把平台确认链接给我。",
+                  "- 标了［日报待办］且平台未勾选的，用 set_todo_done 同步勾选（先 get_todos 取当前 version）。"]
+        return lines.joined(separator: "\n")
+    }
+    var reportURL: URL? { codexNewThreadURL(reportPrompt()) }
 
     // MARK: Schedule
     func lastExpectedRun(before date: Date) -> Date? {
@@ -384,6 +429,12 @@ func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
         if let s = appConfig.conversationURL, !s.isEmpty { return URL(string: s) }
         return nil
     }
+}
+
+func codexNewThreadURL(_ prompt: String) -> URL? {
+    var allowed = CharacterSet.alphanumerics; allowed.insert(charactersIn: "-._~")
+    guard let encoded = prompt.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
+    return URL(string: "codex://threads/new?prompt=" + encoded)
 }
 
 // MARK: - UI
@@ -520,6 +571,7 @@ struct TodoRow: View {
                 if todo.isUnconfirmed { badge("待确认", calm) }
                 if todo.priority == 0 && todo.category != "waiting" { badge("优先", accent) }
                 if store.isHandedOff(todo) { badge("Codex 跟进", calm) }
+                if todo.reportTodo != nil { badge("日报", accent) }
             }
             if let dueText {
                 Text(dueText).font(.system(size: 10, weight: .medium))
@@ -801,6 +853,15 @@ struct MainView: View {
                 Text(store.syncLine).font(.system(size: 9)).foregroundStyle(.secondary)
             }
             Spacer()
+            Button { openURL(store.reportURL) } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "doc.text")
+                    Text(store.completedToday.isEmpty ? "整理日报" : "整理日报 · \(store.completedToday.count)").contentTransition(.numericText())
+                }.font(.system(size: 11, weight: .medium)).foregroundStyle(accent)
+                    .padding(.horizontal, 8).padding(.vertical, 5).background(accent.opacity(0.10), in: Capsule())
+            }
+            .buttonStyle(.plain).help("把今天完成的事带进新的 Codex 对话，整理成日报草稿")
+            .accessibilityLabel("整理今天日报，今天完成 \(store.completedToday.count) 件")
             Button { showSync.toggle() } label: { Image(systemName: "info.circle").font(.system(size: 14)) }
                 .buttonStyle(.plain).foregroundStyle(.secondary).help("上次整理的范围和结果").accessibilityLabel("上次整理详情")
                 .popover(isPresented: $showSync, arrowEdge: .top) { syncDetail }

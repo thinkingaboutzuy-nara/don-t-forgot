@@ -2,7 +2,7 @@
 """Validate and atomically merge an agent-produced task delta. Never edits actions.json.
 
 --dump     full inbox + actions
---open     compact view for a run: open tasks, user feedback, hand-offs, sync
+--open     compact view for a run: open tasks, user feedback, hand-offs, pending report-platform ticks, sync
 --input    merge a delta; closed tasks older than --archive-days move to archive/
 """
 import argparse, datetime as dt, fcntl, json, os, pathlib, tempfile
@@ -65,7 +65,20 @@ def effective_status(task, action, now):
         return auto
     if status == 'snoozed':
         return 'snoozed' if (action.get('until') or 0) > now.timestamp() else auto
+    if platform_newer(task, action):
+        return auto
     return status
+
+
+def platform_newer(task, action):
+    """A tick or untick seen on the report platform after the manual action wins."""
+    changed = (task.get('reportTodo') or {}).get('changedAt')
+    if not changed or not action.get('updatedAt'):
+        return False
+    try:
+        return parse_aware(changed, 'reportTodo.changedAt') > parse_aware(action['updatedAt'], 'updatedAt')
+    except DeltaError:
+        return False
 
 
 def closed_at(task, action):
@@ -99,6 +112,12 @@ def validate_task(t, seen):
         check(isinstance(t['needsConfirm'], bool), f'{key}.needsConfirm 必须是布尔值')
     if 'dispatch' in t:
         check(t['dispatch'] is None or isinstance(t['dispatch'], dict), f'{key}.dispatch 必须是对象')
+    if t.get('reportTodo') is not None:
+        r = t['reportTodo']
+        check(isinstance(r, dict) and isinstance(r.get('id'), str) and r['id'], f'{key}.reportTodo 须有平台待办 id')
+        check(type(r.get('version')) is int and type(r.get('done')) is bool, f'{key}.reportTodo 须有整数 version 与布尔 done')
+        if r.get('changedAt'):
+            parse_aware(r['changedAt'], f'{key}.reportTodo.changedAt')
     if t['category'] in CLOSED_CATEGORIES:
         check(bool(t.get('resolution')), f'{key} 标为 {t["category"]} 时必须写 resolution')
     return key
@@ -202,17 +221,24 @@ def open_view(root):
     inbox = read(root / 'inbox.json', {'tasks': [], 'sync': {}})
     actions = read(root / 'actions.json', {})
     now = utcnow()
-    open_tasks, feedback, handoffs = [], [], []
+    open_tasks, feedback, handoffs, report_sync = [], [], [], []
     for t in inbox['tasks']:
         action = actions.get(t['id'])
         status = effective_status(t, action, now)
+        link = t.get('reportTodo')
+        # Push a manual tick/untick to the platform unless the platform changed it more recently.
+        if link and action and action.get('status') in ['done', 'active'] and not platform_newer(t, action):
+            want = action['status'] == 'done'
+            if want != link['done']:
+                report_sync.append({'id': t['id'], 'todoId': link['id'], 'expectedVersion': link['version'],
+                                    'done': want, 'at': action.get('updatedAt')})
         if status in ['active', 'snoozed']:
             open_tasks.append({
                 'id': t['id'], 'title': t['title'], 'category': t['category'], 'priority': t['priority'],
                 'due': t.get('due'), 'status': status, 'needsConfirm': t.get('needsConfirm', t['title'].startswith('待确认')),
                 'lastEvidence': max((s['time'] for s in t['sources']), default=None),
                 'conversationIds': sorted({s['conversationId'] for s in t['sources']}),
-                'dispatch': t.get('dispatch'),
+                'dispatch': t.get('dispatch'), 'reportTodo': t.get('reportTodo'),
             })
         if action and action.get('status') in ['done', 'dismissed']:
             feedback.append({'id': t['id'], 'title': t['title'], 'status': action['status'],
@@ -221,7 +247,7 @@ def open_view(root):
             handoffs.append({'id': t['id'], 'title': t['title'], 'handoffAt': action['handoffAt']})
     feedback.sort(key=lambda f: f.get('at') or '', reverse=True)
     return {'sync': inbox.get('sync', {}), 'open': open_tasks, 'feedback': feedback[:40],
-            'handoffs': handoffs, 'archivedCount': len(inbox.get('archived', []))}
+            'handoffs': handoffs, 'reportSync': report_sync, 'archivedCount': len(inbox.get('archived', []))}
 
 
 def main():

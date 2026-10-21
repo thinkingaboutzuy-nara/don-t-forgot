@@ -1,0 +1,14 @@
+{
+  "appName": "别忘了",
+  "bundleIdentifier": "local.example.dingtalk-todo",
+  "projectDirectory": "/绝对路径/别忘了",
+  "dataDirectory": "~/Library/Application Support/DingTalkTodo",
+  "conversationURL": "",
+  "dingtalkAppPath": "/Applications/DingTalk.app",
+  "timeZone": "Asia/Taipei",
+  "scheduleHours": [9, 15],
+  "scheduleText": "每天 09:00、15:00 整理",
+  "earliestDate": "2026-10-01",
+  "profile": "<dws profile list 返回的 corpId:userId>",
+  "selfOpenDingTalkId": "<本人 openDingTalkId>"
+}

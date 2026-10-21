@@ -1,0 +1,13 @@
+# 构建产物
+*.app/
+*.app.previous/
+.build-*/
+__pycache__/
+.DS_Store
+
+# 本机实例：账号身份、业务事实、运行记录，不进仓库
+config.json
+整理规则.md
+work/
+历史/
+技能分享/

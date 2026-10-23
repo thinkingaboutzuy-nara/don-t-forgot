@@ -245,6 +245,32 @@ func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
             return (parseDate(a.due) ?? .distantFuture) < (parseDate(b.due) ?? .distantFuture)
         }
     }
+    /// Case-insensitive search over everything a closed card shows; every space-separated word must match.
+    func matches(_ todo: Todo, _ query: String) -> Bool {
+        let words = query.lowercased().split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty else { return true }
+        let a = actions[todo.id]
+        let fields = [todo.title, todo.detail, todo.resolution ?? "", a?.reason ?? "", a?.note ?? ""]
+            + todo.sources.flatMap { [$0.chat, $0.quote, $0.senderName ?? "", $0.recipientName ?? ""] }
+        let haystack = fields.joined(separator: "\n").lowercased()
+        return words.allSatisfy { haystack.contains($0) }
+    }
+    /// Archived cards matching the query, grouped by the day they were closed (newest first).
+    func archivedSections(_ query: String) -> [(title: String, tasks: [Todo])] {
+        var sections: [(title: String, tasks: [Todo])] = []
+        for todo in items(2) where matches(todo, query) {
+            let label = dayLabel(closedDate(todo))
+            if sections.last?.title == label { sections[sections.count - 1].tasks.append(todo) }
+            else { sections.append((label, [todo])) }
+        }
+        return sections
+    }
+    func dayLabel(_ date: Date?) -> String {
+        guard let date else { return "更早" }
+        if appCalendar.isDate(date, inSameDayAs: now) { return "今天" }
+        if let y = appCalendar.date(byAdding: .day, value: -1, to: now), appCalendar.isDate(date, inSameDayAs: y) { return "昨天" }
+        return dateText(date, format: "M月d日")
+    }
     func workGroups() -> [WorkGroup] {
         var today: [Todo] = [], week: [Todo] = [], waiting: [Todo] = [], confirm: [Todo] = []
         for todo in items(0) {
@@ -744,6 +770,8 @@ struct MainView: View {
     @ObservedObject var settings: WindowSettings
     @State private var tab = 0
     @State private var showSync = false
+    @State private var query = ""
+    @FocusState private var searchFocused: Bool
     @AppStorage("confirmGroupExpanded") private var confirmExpanded = false
     var body: some View {
         VStack(spacing: 0) {
@@ -754,6 +782,12 @@ struct MainView: View {
                     tabButton("稍后", 1, count: store.items(1).count)
                     tabButton("已收起", 2, count: store.items(2).count)
                 }.padding(.horizontal, 17).padding(.bottom, 12)
+                .background {
+                    // ⌘F jumps to the archive search from any tab.
+                    Button("") { tab = 2; DispatchQueue.main.async { searchFocused = true } }
+                        .keyboardShortcut("f", modifiers: .command).opacity(0).allowsHitTesting(false)
+                }
+                if tab == 2 && !store.items(2).isEmpty { searchField }
                 if loadedConfig == nil { alertBar("缺少 config.json，正在使用默认设置。请交给 Codex 重新构建。") }
                 if let error = store.saveError ?? store.loadError { alertBar(error) }
                 else if store.inbox.sync?.state == "error" || store.inbox.sync?.state == "partial" {
@@ -810,10 +844,18 @@ struct MainView: View {
                             ForEach(group.tasks) { todo in TodoRow(store: store, todo: todo).transition(rowTransition) }
                         }
                     }
-                } else {
-                    if tab == 2 && !store.items(2).isEmpty {
-                        Text("每张卡片都写着为什么收起；点圆圈可恢复。").font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 4)
+                } else if tab == 2 {
+                    let sections = store.archivedSections(query)
+                    if sections.isEmpty && !store.items(2).isEmpty { noResults }
+                    ForEach(sections, id: \.title) { section in
+                        HStack(spacing: 6) {
+                            Text(section.title).font(.system(size: 12, weight: .semibold))
+                            Text("\(section.tasks.count)").font(.system(size: 10)).foregroundStyle(.secondary)
+                            Spacer()
+                        }.padding(.horizontal, 4).padding(.top, 8)
+                        ForEach(section.tasks) { todo in TodoRow(store: store, todo: todo).transition(rowTransition) }
                     }
+                } else {
                     ForEach(store.items(tab)) { todo in TodoRow(store: store, todo: todo).transition(rowTransition) }
                 }
             }.padding(.horizontal, 14).padding(.bottom, 14)
@@ -836,6 +878,31 @@ struct MainView: View {
             Button { withAnimation(.snappy(duration: 0.25)) { confirmExpanded.toggle() } } label: { content }
                 .buttonStyle(.plain).accessibilityLabel(confirmExpanded ? "收起待确认" : "展开待确认")
         } else { content }
+    }
+
+    var searchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("搜索：标题、理由、备注、聊天原文", text: $query)
+                .textFieldStyle(.plain).focused($searchFocused)
+                .onExitCommand { query = ""; searchFocused = false }
+            if !query.isEmpty {
+                Text("\(store.archivedSections(query).reduce(0) { $0 + $1.tasks.count }) 件").foregroundStyle(.secondary).monospacedDigit()
+                Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.plain).foregroundStyle(.tertiary).accessibilityLabel("清空搜索")
+            }
+        }
+        .font(.system(size: 12)).padding(.horizontal, 10).padding(.vertical, 7)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 14).padding(.bottom, 8)
+    }
+
+    var noResults: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").font(.system(size: 26, weight: .light)).foregroundStyle(accent.opacity(0.7))
+            Text("没有找到“\(query)”").font(.system(size: 13, weight: .medium))
+            Button("清空搜索") { query = "" }.font(.system(size: 11)).buttonStyle(.bordered)
+        }.frame(maxWidth: .infinity).padding(.vertical, 40)
     }
 
     var emptyState: some View {

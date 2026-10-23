@@ -123,8 +123,20 @@ CHECKS = r'''
         expect(report.contains("2026-10-21") && report.contains("交付周报") && report.contains("备注：已发群里") && !report.contains("昨天的事"), "report prompt content")
         expect(report.contains("submit_report") && report.contains("工时不要猜"), "report prompt boundaries")
         expect(store.reportURL?.absoluteString.hasPrefix("codex://threads/new?prompt=") == true, "report link")
+        // Archive search and day sections
+        store.now = parseDate("2026-10-22T18:00:00+08:00")!
+        var withQuote = task("q1", "action", title: "核对成都编码", sources: [Source(chat: "设备采购群", time: "2026-10-20 10:00", quote: "请把 20 台编码发我", messageId: "m", conversationId: "c", senderName: "叶龙")])
+        withQuote.detail = "出入库单待补"
+        store.inbox.tasks = [withQuote, task("q2", "action", title: "交付周报"), task("q3", "resolved", title: "旧事", resolution: "Codex 已发布")]
+        store.actions = ["q1": LocalAction(status: "done", until: nil, updatedAt: "2026-10-22T02:00:00Z", reason: "对方已处理", note: "叶龙确认收到"),
+                         "q2": LocalAction(status: "done", until: nil, updatedAt: "2026-10-21T02:00:00Z", reason: "办完了")]
+        func found(_ q: String) -> [String] { store.archivedSections(q).flatMap { $0.tasks.map(\.id) } }
+        expect(found("") == ["q1", "q2", "q3"], "empty query lists all, newest first \(found(""))")
+        expect(found("叶龙") == ["q1"] && found("编码 出入库") == ["q1"] && found("对方已处理") == ["q1"], "matches quote, sender, detail and reason")
+        expect(found("codex") == ["q3"] && found("编码 周报").isEmpty, "case-insensitive; all words must match")
+        expect(store.archivedSections("").map(\.title) == ["今天", "昨天", "10月20日"], "day sections \(store.archivedSections("").map(\.title))")
         if failed > 0 { exit(1) }
-        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link and daily report")
+        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link and daily report, archive search")
     }
 }
 '''

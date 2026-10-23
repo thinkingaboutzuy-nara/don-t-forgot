@@ -12,7 +12,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
 | `config.json` | 本机实例配置（账号、路径、时区、排程、日期下限），构建时打包进 app |
 | `整理规则.md` | 定时整理的唯一现行规则 |
 | `使用说明.md` | 给用户看的操作说明 |
-| `tests/` | `verify_store.py`（窗口状态逻辑）、`verify_merge.py`（合并器），都只用临时合成数据 |
+| `tests/` | `verify_store.py`（窗口状态逻辑）、`verify_merge.py`（合并器），都只用临时合成数据；`ui_snapshot.py` 在数据副本上驱动真实窗口截图，不需要录屏权限 |
 | `package_skill.sh` | 重新生成 `技能分享/钉钉待办悬浮窗-skill.zip` |
 | `README.md`、`config.example.json`、`.gitignore` | 仓库首页、配置模板、不进仓库的本机内容清单 |
 | `work/runs/` | 每轮整理的增量和摘要，只留最近 6 轮 |
@@ -40,7 +40,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
 ## 修改流程
 
 1. **改界面或状态逻辑**：编辑 `TodoWindow.swift`。状态优先级在 Swift 的 `TodoStore.status` 和 Python 的 `effective_status` 各有一份，两边要一起改。
-2. **验证**：运行 `python3 tests/verify_store.py && python3 tests/verify_merge.py`。界面改动另用 `--test-mode --data-dir <临时目录>` 启动副本，只检查受影响的操作。
+2. **验证**：运行 `python3 tests/verify_store.py && python3 tests/verify_merge.py`。界面改动用 `python3 tests/ui_snapshot.py --data <数据副本> --out <目录> --steps "..."` 截图，只检查受影响的操作；不要指向正式数据目录。
 3. **构建并重启**：运行 `python3 build_app.py`；如有旧的 `别忘了.app.previous`，确认无用后先删除。然后运行 `launchctl kickstart -k gui/$(id -u)/local.vn.dingtalk-todo`。
 4. **改整理规则**：直接改写 `整理规则.md` 的对应条目，不追加补丁段落；定时任务的 prompt 不需要动。
 5. **同步到 Gitea**（用户要求每次修复都同步）：`git add -A && git commit && git push`。远端地址见 `git remote -v`。

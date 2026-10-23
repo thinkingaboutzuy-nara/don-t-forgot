@@ -4,8 +4,10 @@
 python3 tests/ui_snapshot.py --data <dir with inbox.json/actions.json> --out <dir> \
     --steps "click,300,83;wait,0.8;snap,archived;key,cmdf;key,手机;wait,0.6;snap,search"
 
-Steps: snap,<name> | click,<x>,<y from top, points> | key,<text> or key,cmd<char> (e.g. cmdf, cmd=) | wait,<seconds>.
-The data dir is used as-is, so pass a copy, never the live data directory.
+Steps: snap,<name> | click,<x>,<y from top, points> | key,<text> or key,cmd<char> (e.g. cmdf, cmd=) | wait,<seconds>
+     | notify,<open|complete|snooze-1h>,<task id> (as if that notification, or its button, was clicked).
+snap also saves other visible windows, such as the ⓘ popover, as <name>-window<N>.png.
+The data dir is used as-is, so pass a copy or tests/ui_fixture.py output, never the live data directory.
 """
 import argparse
 import pathlib
@@ -20,9 +22,13 @@ HARNESS = r'''
 import AppKit
 import SwiftUI
 @MainActor func snap(_ d: AppDelegate, _ name: String) {
-    guard let v = d.panel.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
-    v.cacheDisplay(in: v.bounds, to: rep)
-    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: CommandLine.arguments.last! + "/" + name + ".png"))
+    func save(_ w: NSWindow, _ file: String) {
+        guard let v = w.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+        v.cacheDisplay(in: v.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: CommandLine.arguments.last! + "/" + file + ".png"))
+    }
+    save(d.panel, name)
+    for (i, w) in NSApp.windows.enumerated() where w !== d.panel && w.isVisible && w.frame.width > 40 { save(w, "\(name)-window\(i)") }
 }
 @MainActor func click(_ d: AppDelegate, _ x: CGFloat, _ yTop: CGFloat) {
     let p = NSPoint(x: x, y: d.panel.frame.height - yTop)
@@ -51,6 +57,9 @@ import SwiftUI
             case "snap": DispatchQueue.main.asyncAfter(deadline: .now() + t) { snap(d, parts[1]) }
             case "click": DispatchQueue.main.asyncAfter(deadline: .now() + t) { click(d, CGFloat(Double(parts[1])!), CGFloat(Double(parts[2])!)) }
             case "key": DispatchQueue.main.asyncAfter(deadline: .now() + t) { key(d, parts[1]) }; t += 0.2
+            case "notify": DispatchQueue.main.asyncAfter(deadline: .now() + t) {
+                d.handleNotification(action: parts[1] == "open" ? "com.apple.UNNotificationDefaultActionIdentifier" : parts[1], todoId: parts[2])
+            }
             case "wait": t += Double(parts[1])!
             default: break
             }

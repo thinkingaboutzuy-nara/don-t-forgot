@@ -1,0 +1,39 @@
+# Compile and test the window on macOS with synthetic data only, and keep screenshots of the affected screens.
+name: macOS check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Taipei
+    steps:
+      - uses: actions/checkout@v4
+      - name: Merge logic
+        run: python3 tests/verify_merge.py
+      - name: Window state logic
+        run: python3 tests/verify_store.py
+      - name: Build app
+        run: |
+          cp config.example.json config.json
+          python3 build_app.py
+          plutil -p 别忘了.app/Contents/Info.plist | grep -E 'ShortVersion|CFBundleVersion'
+          test -f 别忘了.app/Contents/Resources/changelog.md
+      - name: Screenshots
+        run: |
+          python3 tests/ui_fixture.py "$RUNNER_TEMP/data"
+          python3 tests/ui_snapshot.py --data "$RUNNER_TEMP/data" --out shots --steps \
+            "snap,01-main;click,349,596;wait,0.8;snap,02-info;click,200,40;wait,0.5;notify,complete,demo-snoozed;wait,1.2;snap,03-notify-complete;notify,open,demo-confirm;wait,1.2;snap,04-notify-confirm;notify,snooze-1h,demo-urgent;wait,0.8;snap,05-snooze-again"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: shots/
+          if-no-files-found: warn

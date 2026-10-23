@@ -148,8 +148,135 @@ CHECKS = r'''
         expect(store.summaryText.hasPrefix("新1"), "summary leads with new count \(store.summaryText)")
         store.markSeen(at: parseDate("2026-10-22T02:00:00Z")!)
         expect(store.newCount == 0 && persisted == parseDate("2026-10-22T02:00:00Z"), "markSeen clears and persists")
+        // Own deadline: wins for groups, ordering and due notices; clear and undo go back to整理's due
+        store.now = parseDate("2026-10-22T10:00:00+08:00")!
+        store.actions = [:]
+        store.seenThrough = .distantFuture
+        let mine = task("d1", "action", due: "2026-10-25T18:00:00+08:00")
+        store.inbox.tasks = [mine, task("d2", "action", due: "2026-10-24T18:00:00+08:00")]
+        expect(store.workGroups().map(\.id) == ["week"] && store.items(0).map(\.id) == ["d2", "d1"], "deadline from 整理")
+        expect(store.setDue(mine, parseDate("2026-10-22T17:00:00+08:00")!), "set own deadline")
+        expect(store.actions["d1"]?.dueOverride == "2026-10-22T17:00:00+08:00", "override stored in app time zone \(store.actions["d1"]?.dueOverride ?? "nil")")
+        expect(store.workGroups().first?.tasks.map(\.id) == ["d1"] && store.workGroups().first?.id == "today", "override moves card to 今天优先")
+        expect(store.items(0).map(\.id) == ["d1", "d2"], "override changes ordering")
+        let dueNotice = store.scheduledNotices().first { $0.todoId == "d1" }
+        expect(dueNotice?.kind == .due && dueNotice?.fireAt == parseDate("2026-10-22T16:45:00+08:00"), "due notice 15 minutes before new deadline")
+        expect(store.handoffPrompt(mine).contains("10月22日 17:00（我自己改的）"), "hand-off shows own deadline")
+        store.undoLast()
+        expect(store.actions["d1"] == nil && store.workGroups().map(\.id) == ["week"], "undo removes override")
+        store.setDue(mine, parseDate("2026-10-23T09:00:00+08:00")!)
+        store.markHandoff(mine)
+        expect(store.complete(mine, reason: "办完了", note: ""), "complete with override")
+        expect(store.actions["d1"]?.dueOverride == "2026-10-23T09:00:00+08:00" && store.actions["d1"]?.handoffAt != nil, "completion keeps override and hand-off")
+        store.restore(mine)
+        store.setDue(mine, nil)
+        expect(store.actions["d1"]?.dueOverride == nil && store.due(mine) == parseDate("2026-10-25T18:00:00+08:00"), "clear goes back to original deadline")
+        store.actions = [:]
+        store.setDue(mine, parseDate("2026-10-23T09:00:00+08:00")!)
+        store.setDue(mine, nil)
+        expect(store.actions["d1"] == nil, "clearing an override-only entry removes it")
+        expect(store.dueChoices.map(\.label) == ["今天 18:00", "明天 18:00", "下周一 09:00"], "deadline quick choices")
+        // Snooze notice: fires at until, carries the snooze actions, cancelled by undo, restore and completion
+        store.actions = [:]
+        let later = task("s1", "action")
+        store.inbox.tasks = [later]
+        func snoozeNotices(_ s: TodoStore = store) -> [PlannedNotice] { s.scheduledNotices().filter { $0.kind == .snooze } }
+        store.snooze(later, until: store.snoozeChoices[1].date, label: "明天 09:00")
+        let sn = snoozeNotices()
+        expect(sn.count == 1 && sn[0].fireAt == parseDate("2026-10-23T09:00:00+08:00") && sn[0].todoId == "s1", "snooze notice fires at until")
+        expect(sn.first?.category == NoticeAction.snoozeCategory && sn.first?.title == "回到待办：s1", "snooze notice offers 完成 / 再推 1 小时")
+        let reopened = TodoStore(root: dir, live: false)
+        reopened.now = store.now; reopened.inbox.tasks = [later]
+        expect(snoozeNotices(reopened) == sn, "notices rebuilt from actions.json after restart")
+        store.undoLast()
+        expect(snoozeNotices().isEmpty, "undo cancels snooze notice")
+        store.snooze(later, until: store.snoozeChoices[0].date, label: "1 小时后")
+        store.restore(later)
+        expect(snoozeNotices().isEmpty, "restore cancels snooze notice")
+        store.snooze(later, until: store.snoozeChoices[0].date, label: "1 小时后")
+        store.complete(later, reason: "办完了", note: "")
+        expect(snoozeNotices().isEmpty, "completion cancels snooze notice")
+        store.snooze(later, until: store.now.addingTimeInterval(1800), label: "")
+        store.snooze(later, until: store.now.addingTimeInterval(3600), label: "1 小时后")
+        expect(store.actions["s1"]?.until == store.now.timeIntervalSince1970 + 3600 && snoozeNotices().count == 1
+               && snoozeNotices().first?.fireAt == store.now.addingTimeInterval(3600), "再推 1 小时 writes a new until and one notice")
+        store.muted = [.snooze]
+        expect(snoozeNotices().isEmpty, "snooze notices can be turned off")
+        store.muted = [.due]
+        store.inbox.tasks = [later, mine]
+        expect(store.scheduledNotices().allSatisfy { $0.kind != .due } && snoozeNotices().count == 1, "due notices off independently")
+        store.muted = []
+        // Morning summary: first successful run of the day, once a day, own work only, same numbers as the header
+        store.actions = [:]
+        store.now = parseDate("2026-10-22T09:05:00+08:00")!
+        store.inbox.tasks = [task("m1", "action", priority: 0), task("m2", "action", due: "2026-10-21T18:00:00+08:00"),
+                             task("m3", "waiting"), task("m4", "action", due: "2026-10-24T18:00:00+08:00"), task("m5", "action", title: "待确认：线索")]
+        var shownDay: String?
+        store.persistSummaryDay = { shownDay = $0 }
+        store.summaryShownDay = nil
+        store.inbox.sync = SyncInfo(state: "ok", message: nil, scannedThrough: "2026-10-21T15:00:40+08:00", scope: nil, schedule: nil, mode: nil, runThreadId: nil)
+        expect(store.takeMorningSummary() == nil && shownDay == nil, "no summary before today's run")
+        store.inbox.sync = SyncInfo(state: "error", message: nil, scannedThrough: "2026-10-22T09:00:40+08:00", scope: nil, schedule: nil, mode: nil, runThreadId: nil)
+        expect(store.takeMorningSummary() == nil && shownDay == nil, "failed run shows no summary")
+        store.inbox.sync?.state = "ok"
+        let morning = store.takeMorningSummary()
+        expect(morning?.body == "今天 2 件 · 逾期 1 件 · 本周 1 件 · 等回复 1 件", "summary counts \(morning?.body ?? "nil")")
+        expect(store.summaryText == "今天2 · 本周1 · 等回复1 · 待确认1", "header agrees \(store.summaryText)")
+        expect(shownDay == "2026-10-22" && store.takeMorningSummary() == nil, "only once a day")
+        store.now = parseDate("2026-10-22T15:05:00+08:00")!
+        store.inbox.sync?.scannedThrough = "2026-10-22T15:00:40+08:00"
+        expect(store.takeMorningSummary() == nil, "later run the same day stays quiet")
+        store.now = parseDate("2026-10-23T09:05:00+08:00")!
+        store.inbox.sync?.scannedThrough = "2026-10-23T09:00:20+08:00"
+        store.inbox.tasks = [task("m3", "waiting")]
+        expect(store.takeMorningSummary() == nil && shownDay == "2026-10-23", "nothing of my own: no summary, day still handled")
+        // 催一下: confirmed waiting items from 3 days, copied text within 200 characters without secrets, notified once
+        store.now = parseDate("2026-10-22T10:00:00+08:00")!
+        store.actions = [:]
+        let asked = Source(chat: "设备采购群", time: "2026-10-18 09:30", quote: "请确认到货，密码：Abc12345，表单 https://x.cn/f?token=zzz\n谢谢",
+                           messageId: "m1", conversationId: "c", senderName: "我", senderId: "self", recipientName: "叶龙")
+        let replied = Source(chat: "设备采购群", time: "2026-10-19 11:00", quote: "收到", messageId: "m2", conversationId: "c",
+                             senderName: "叶龙", senderId: "u-ye", recipientName: "我")
+        let w4 = task("w4", "waiting", title: "等叶龙确认到货", sources: [asked, replied])
+        let w2 = task("w2", "waiting", sources: [Source(chat: "c", time: "2026-10-20 09:00", quote: "q", messageId: "m", conversationId: "c")])
+        let wc = task("wc", "waiting", title: "待确认：陈盈是否到货", sources: [asked])
+        store.inbox.tasks = [w4, w2, wc]
+        expect(store.canNudge(w4) && !store.canNudge(w2) && !store.canNudge(wc), "nudge only for confirmed waiting from 3 days")
+        expect(store.nudgeTarget(w4) == "设备采购群", "unknown own ID: chat name")
+        expect(store.nudgeTarget(w4, me: "self") == "叶龙" && store.nudgeTarget(task("x", "waiting", sources: [asked]), me: "self") == "叶龙", "other side of latest known message")
+        let nudge = store.nudgeText(w4)
+        expect(nudge.count <= 200 && nudge.hasPrefix("设备采购群，") && nudge.contains("等了 4 天") && nudge.contains("原消息（10/18）"), "nudge text \(nudge)")
+        expect(!nudge.contains("Abc12345") && !nudge.contains("token") && !nudge.contains("\n谢谢"), "nudge text has no secrets \(nudge)")
+        let longOne = task("wl", "waiting", title: String(repeating: "长", count: 140),
+                           sources: [Source(chat: String(repeating: "群", count: 80), time: "2026-10-10 09:00", quote: String(repeating: "字", count: 600), messageId: "m", conversationId: "c")])
+        expect(store.nudgeText(longOne).count <= 200, "long nudge clipped to 200")
+        store.now = parseDate("2026-10-22T07:00:00+08:00")!
+        expect(store.takeNudges().isEmpty && store.actions.isEmpty, "no nudge notification before the first run hour")
+        store.now = parseDate("2026-10-22T10:00:00+08:00")!
+        let firstNudges = store.takeNudges()
+        expect(firstNudges.map(\.todoId) == ["w4"] && firstNudges.first?.title == "设备采购群 的回复已等 4 天", "nudge notice \(firstNudges.map(\.title))")
+        expect(store.actions["w4"]?.nudgedAt != nil && store.status(w4) == "active", "nudgedAt recorded without changing status")
+        expect(store.takeNudges().isEmpty, "each item notified once")
+        store.actions = [:]
+        store.inbox.tasks = (1...5).map { i in task("b\(i)", "waiting", sources: [asked]) }
+        let batch = store.takeNudges()
+        expect(batch.count == 1 && batch.first?.title == "5 件等回复已满 3 天" && store.actions.count == 5, "many at once: one combined notice")
+        store.actions = [:]
+        store.muted = [.nudge]
+        expect(store.takeNudges().isEmpty && store.actions.isEmpty, "muted nudges are not recorded")
+        store.muted = []
+        // Notification click target
+        store.inbox.tasks = [w4]
+        store.requestFocus("missing")
+        expect(store.focus == nil, "unknown card is ignored")
+        store.requestFocus("w4", complete: true)
+        expect(store.focus?.id == "w4" && store.focus?.complete == true && store.tab(for: w4) == 0, "focus request")
+        // Changelog
+        let log = parseChangelog("# 更新日志\n\n说明文字\n\n## 2026-10-23\n- 稍后到点会弹窗\n  并可再推 1 小时\n- 可以自己改期限\n\n## 2026-10-21\n* 首版\n")
+        expect(log.map(\.title) == ["2026-10-23", "2026-10-21"] && log[0].items == ["稍后到点会弹窗并可再推 1 小时", "可以自己改期限"] && log[1].items == ["首版"], "changelog parse \(log)")
+        expect(parseChangelog("").isEmpty && parseChangelog("没有标题\n- 孤立条目").isEmpty, "no changelog is fine")
         if failed > 0 { exit(1) }
-        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link and daily report, archive search, new badge")
+        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link and daily report, archive search, new badge, own deadline, snooze/due notices, morning summary, nudge, focus, changelog")
     }
 }
 '''

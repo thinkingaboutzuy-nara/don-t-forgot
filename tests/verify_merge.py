@@ -87,12 +87,20 @@ def verify(script):
         handoff = copy.deepcopy(payload['tasks'][0])
         handoff.update(id='fixture-4', title='交给 Codex 的事')
         module.merge(root, {'tasks': [handoff]})
-        actions['fixture-4'] = {'handoffAt': '2026-10-21T02:00:00Z', 'updatedAt': '2026-10-21T02:00:00Z'}
+        actions['fixture-4'] = {'handoffAt': '2026-10-21T02:00:00Z', 'updatedAt': '2026-10-21T02:00:00Z',
+                                'dueOverride': '2026-10-24T18:00:00+08:00', 'nudgedAt': '2026-10-21T02:00:00Z'}
         (root / 'actions.json').write_text(json.dumps(actions))
         view = module.open_view(root)
         assert [t['id'] for t in view['open']] == ['fixture-4'], view['open']
-        assert view['feedback'][0]['reason'] == '对方已处理'
+        assert view['open'][0]['dueOverride'] == '2026-10-24T18:00:00+08:00' and view['open'][0]['due'] is None, view['open']
+        assert view['feedback'][0]['reason'] == '对方已处理' and len(view['feedback']) == 1
         assert view['handoffs'][0]['id'] == 'fixture-4'
+        # A run that writes a deadline from chat leaves the user's own one in actions.json alone
+        dated = copy.deepcopy(handoff)
+        dated['due'] = '2026-10-23T18:00:00+08:00'
+        module.merge(root, {'tasks': [dated]})
+        assert (root / 'actions.json').read_text() == json.dumps(actions)
+        assert module.open_view(root)['open'][0]['dueOverride'] == '2026-10-24T18:00:00+08:00'
 
         # Archive: closed more than 30 days moves out, title stays reserved, same ID restores
         inbox = json.loads((root / 'inbox.json').read_text())
@@ -145,7 +153,7 @@ def verify(script):
         run = subprocess.run([sys.executable, '-O', str(script), '--data-dir', tmp, '--input', str(delta)],
                              capture_output=True, text=True)
         assert run.returncode != 0 and '增量被拒绝' in run.stderr, run
-    print('PASS: stable ID, manual actions, failed coverage, atomic rejection, stale, open view, archive, report sync, python -O')
+    print('PASS: stable ID, manual actions, failed coverage, atomic rejection, stale, open view with own deadline, archive, report sync, python -O')
 
 
 if __name__ == '__main__':

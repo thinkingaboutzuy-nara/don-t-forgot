@@ -15,6 +15,8 @@ struct AppConfig: Decodable {
     var timeZone: String
     var scheduleHours: [Int]?
     var scheduleText: String?
+    /// Used to tell who a waiting item is waiting on (compared with Source.senderId).
+    var selfOpenDingTalkId: String?
     var hours: [Int] { (scheduleHours ?? [9, 15]).sorted() }
     var schedule: String { scheduleText ?? "每天 " + hours.map { String(format: "%02d:00", $0) }.joined(separator: "、") + " 整理" }
     static let fallback = AppConfig(appName: "别忘了", bundleIdentifier: nil, projectDirectory: nil,
@@ -116,6 +118,11 @@ struct LocalAction: Codable, Equatable {
     var reason: String?
     var note: String?
     var handoffAt: String?
+    /// When the one-time “waited 3 days” notification was sent.
+    var nudgedAt: String?
+    /// The user's own deadline; wins over `due` from整理, which never overwrites it.
+    var dueOverride: String?
+    var isEmpty: Bool { status == nil && handoffAt == nil && nudgedAt == nil && dueOverride == nil }
 }
 struct Closure {
     var icon: String
@@ -146,6 +153,84 @@ enum CardLength: Int, CaseIterable, Identifiable {
 
 let completeReasons = ["办完了", "对方已处理", "不用做了"]
 let dismissReasons = ["不是我的事", "已在别处跟进", "太琐碎", "重复了"]
+
+/// Each kind of system notification can be turned off on its own in ⓘ; all are on by default.
+enum NotifyKind: String, CaseIterable, Identifiable {
+    case due, snooze, summary, nudge
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .due: return "到期前 15 分钟"
+        case .snooze: return "稍后提醒到点"
+        case .summary: return "早上摘要"
+        case .nudge: return "等回复满 3 天"
+        }
+    }
+}
+/// A notification the window wants delivered. `fireAt == nil` means now.
+struct PlannedNotice: Equatable {
+    var identifier: String
+    var kind: NotifyKind
+    var todoId: String?
+    var fireAt: Date?
+    var title: String
+    var body: String
+    var category: String?
+}
+/// Notification category and action identifiers shared by the planner and the delegate.
+enum NoticeAction {
+    static let snoozeCategory = "snooze"
+    static let complete = "complete"
+    static let snoozeHour = "snooze-1h"
+}
+/// Ask the window to show one card, e.g. after a notification click. `complete` also opens the reason panel.
+struct FocusRequest: Equatable {
+    var token = UUID()
+    var id: String
+    var complete = false
+}
+
+struct ChangelogEntry: Identifiable, Equatable {
+    var title: String
+    var items: [String]
+    var id: String { title }
+}
+/// `## 标题` starts an entry, `- ` lines are its items, indented lines continue the previous item.
+func parseChangelog(_ text: String) -> [ChangelogEntry] {
+    var entries: [ChangelogEntry] = []
+    for raw in text.components(separatedBy: .newlines) {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("## ") {
+            entries.append(ChangelogEntry(title: String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces), items: []))
+        } else if entries.isEmpty || line.isEmpty {
+            continue
+        } else if line.hasPrefix("- ") || line.hasPrefix("* ") {
+            entries[entries.count - 1].items.append(String(line.dropFirst(2)))
+        } else if raw.hasPrefix(" "), !entries[entries.count - 1].items.isEmpty {
+            entries[entries.count - 1].items[entries[entries.count - 1].items.count - 1] += line
+        }
+    }
+    return entries
+}
+
+func clip(_ text: String, _ limit: Int) -> String {
+    guard text.count > limit else { return text }
+    return limit <= 1 ? String(text.prefix(max(0, limit))) : String(text.prefix(limit - 1)) + "…"
+}
+/// Best-effort removal of passwords, keys and tokens from text the user is about to paste elsewhere.
+func redactSecrets(_ text: String) -> String {
+    let rules: [(String, String)] = [
+        (#"(?i)(密码|口令|验证码|password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|cookie)(\s*[:：=是为]?\s*)[A-Za-z0-9!@#$%^&*._+=/\-]{4,}"#, "$1$2***"),
+        (#"(https?://[^\s?？]+)\?\S+"#, "$1"),
+        (#"[A-Za-z0-9_\-]{24,}"#, "***"),
+    ]
+    var out = text
+    for (pattern, template) in rules {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
+        out = re.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out), withTemplate: template)
+    }
+    return out
+}
 
 private let isoFractional: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
@@ -179,6 +264,9 @@ func dateText(_ date: Date, format: String = "M/d HH:mm") -> String {
     return f.string(from: date)
 }
 func isoNow() -> String { isoPlain.string(from: Date()) }
+/// Readable timestamp in the app's time zone, e.g. 2026-10-24T18:00:00+08:00.
+private let isoLocal: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.timeZone = appTimeZone; return f }()
+func isoLocalText(_ date: Date) -> String { isoLocal.string(from: date) }
 
 @MainActor final class TodoStore: ObservableObject {
     @Published var inbox = Inbox(schemaVersion: 1, updatedAt: nil, tasks: [], sync: nil) { didSet { derived = nil } }
@@ -190,6 +278,16 @@ func isoNow() -> String { isoPlain.string(from: Date()) }
     /// Items first merged after this moment carry a “新” badge until the user looks at the window.
     @Published var seenThrough = Date.distantPast
     var persistSeen: ((Date) -> Void)?
+    /// Notification kinds the user turned off in ⓘ.
+    @Published var muted: Set<NotifyKind> = []
+    var persistMuted: ((Set<NotifyKind>) -> Void)?
+    /// Day (yyyy-MM-dd) the morning summary was last handled; at most once a day.
+    var summaryShownDay: String?
+    var persistSummaryDay: ((String) -> Void)?
+    /// Card the window should scroll to and highlight. The two tokens record who already handled it.
+    @Published var focus: FocusRequest?
+    var scrolledFocus: UUID?
+    var highlightedFocus: UUID?
     var onChange: (() -> Void)?
     /// Everything a redraw needs, computed once per change of inbox, actions or clock.
     private struct Derived {
@@ -263,10 +361,14 @@ func isoNow() -> String { isoPlain.string(from: Date()) }
         return s
     }
     func isArchived(_ todo: Todo) -> Bool { ["done", "dismissed"].contains(status(todo)) }
+    /// The deadline everything uses: the user's own override first, then整理's `due`.
+    func due(_ todo: Todo) -> Date? { parseDate(actions[todo.id]?.dueOverride) ?? parseDate(todo.due) }
+    func hasDueOverride(_ todo: Todo) -> Bool { parseDate(actions[todo.id]?.dueOverride) != nil }
     var endOfToday: Date { appCalendar.date(byAdding: .day, value: 1, to: appCalendar.startOfDay(for: now))! }
     func isUrgent(_ todo: Todo) -> Bool {
-        todo.priority == 0 || parseDate(todo.due).map { $0 < endOfToday } == true
+        todo.priority == 0 || due(todo).map { $0 < endOfToday } == true
     }
+    func isOverdue(_ todo: Todo) -> Bool { due(todo).map { $0 < now } == true }
     func closedDate(_ todo: Todo) -> Date? { cache.closed[todo.id] ?? computeClosedDate(todo) }
     private func computeClosedDate(_ todo: Todo) -> Date? {
         if let a = actions[todo.id], ["done", "dismissed"].contains(a.status ?? "") { return parseDate(a.updatedAt) }
@@ -282,7 +384,7 @@ func isoNow() -> String { isoPlain.string(from: Date()) }
         let pick = { (wanted: Set<String>) in self.inbox.tasks.filter { wanted.contains(d.status[$0.id] ?? "") } }
         d.items[0] = pick(["active"]).sorted { a, b in
             if a.priority != b.priority { return a.priority < b.priority }
-            return (parseDate(a.due) ?? .distantFuture) < (parseDate(b.due) ?? .distantFuture)
+            return (self.due(a) ?? .distantFuture) < (self.due(b) ?? .distantFuture)
         }
         d.items[1] = pick(["snoozed"]).sorted { (actions[$0.id]?.until ?? 0) < (actions[$1.id]?.until ?? 0) }
         d.items[2] = pick(["done", "dismissed"]).sorted { (d.closed[$0.id] ?? .distantPast) > (d.closed[$1.id] ?? .distantPast) }
@@ -349,11 +451,56 @@ func isoNow() -> String { isoPlain.string(from: Date()) }
         if let n = groups["confirm"] { parts.append("待确认\(n)") }
         return parts.isEmpty ? "眼前没有待办" : parts.joined(separator: " · ")
     }
+    /// Morning summary line. Counts come from the same groups as the header summary.
+    var morningSummaryText: String {
+        let groups = Dictionary(uniqueKeysWithValues: workGroups().map { ($0.id, $0.tasks) })
+        let today = groups["today"] ?? []
+        var parts = ["今天 \(today.count) 件"]
+        let late = today.filter(isOverdue).count
+        if late > 0 { parts.append("逾期 \(late) 件") }
+        if let n = groups["week"]?.count { parts.append("本周 \(n) 件") }
+        if newCount > 0 { parts.append("新 \(newCount) 件") }
+        if let n = groups["waiting"]?.count { parts.append("等回复 \(n) 件") }
+        return parts.joined(separator: " · ")
+    }
+    /// True once today's first scheduled run has merged successfully.
+    var todaysFirstRunDone: Bool {
+        guard inbox.sync?.state == "ok", let scanned = parseDate(inbox.sync?.scannedThrough),
+              appCalendar.isDate(scanned, inSameDayAs: now) else { return false }
+        let first = appCalendar.date(byAdding: .hour, value: appConfig.hours.first ?? 9, to: appCalendar.startOfDay(for: now))!
+        // Same 10-minute tolerance as late-run detection: a run that starts on time may scan through a little before the slot.
+        return scanned >= first.addingTimeInterval(-10 * 60)
+    }
     func waitingDays(_ todo: Todo) -> Int? {
         guard todo.category == "waiting" else { return nil }
         let since = parseDate(todo.waitingSince) ?? todo.sources.compactMap { parseDate($0.time) }.min() ?? parseDate(todo.firstSeen)
         guard let since else { return nil }
         return appCalendar.dateComponents([.day], from: appCalendar.startOfDay(for: since), to: appCalendar.startOfDay(for: now)).day
+    }
+    /// Confirmed waiting items on the 待办 tab that have waited 3 days or more get “催一下”.
+    func canNudge(_ todo: Todo) -> Bool {
+        status(todo) == "active" && !todo.isUnconfirmed && (waitingDays(todo) ?? 0) >= 3
+    }
+    /// Who the user is waiting on: the other side of the latest message whose direction is known; otherwise the chat name.
+    func nudgeTarget(_ todo: Todo, me: String = appConfig.selfOpenDingTalkId ?? "") -> String {
+        let latestFirst = todo.sources.sorted { (parseDate($0.time) ?? .distantPast) > (parseDate($1.time) ?? .distantPast) }
+        for s in latestFirst where !me.isEmpty {
+            guard let sender = s.senderId, !sender.isEmpty else { continue }
+            let name = sender == me ? s.recipientName : s.senderName
+            if let name, !name.isEmpty { return name }
+        }
+        return latestFirst.first.map(\.chat).flatMap { $0.isEmpty ? nil : $0 } ?? "对方"
+    }
+    /// A ready-to-paste follow-up of at most 200 characters. Copied only; nothing is sent.
+    func nudgeText(_ todo: Todo) -> String {
+        let days = waitingDays(todo) ?? 0
+        let head = "\(clip(nudgeTarget(todo), 20))，想跟进一下「\(clip(todo.displayTitle, 60))」，已经等了 \(days) 天，方便时回个进度吗？"
+        let first = todo.sources.min { (parseDate($0.time) ?? .distantFuture) < (parseDate($1.time) ?? .distantFuture) }
+        guard let first else { return clip(head, 200) }
+        let label = "\n原消息" + (parseDate(first.time).map { "（\(dateText($0, format: "M/d"))）" } ?? "") + "："
+        let quote = redactSecrets(first.quote).split(whereSeparator: \.isNewline).joined(separator: " ")
+        let room = 200 - head.count - label.count
+        return room >= 8 ? head + label + clip(quote, room) : clip(head, 200)
     }
     func isNew(_ todo: Todo) -> Bool {
         status(todo) == "active" && (parseDate(todo.firstSeen).map { $0 > seenThrough } ?? false)
@@ -394,9 +541,15 @@ func isoNow() -> String { isoPlain.string(from: Date()) }
     }
     @discardableResult func set(_ todo: Todo, _ status: String, until: Date? = nil, reason: String? = nil, note: String? = nil, undoText: String) -> Bool {
         let previous = actions[todo.id]
+        var entry = previous ?? LocalAction(status: nil, until: nil, updatedAt: isoNow())
+        entry.status = status; entry.until = until?.timeIntervalSince1970; entry.updatedAt = isoNow()
+        entry.reason = reason; entry.note = (note?.isEmpty ?? true) ? nil : note
         var next = actions
-        next[todo.id] = LocalAction(status: status, until: until?.timeIntervalSince1970, updatedAt: isoNow(),
-                                    reason: reason, note: (note?.isEmpty ?? true) ? nil : note, handoffAt: previous?.handoffAt)
+        next[todo.id] = entry
+        return commit(next, todo: todo, previous: previous, undoText: undoText)
+    }
+    /// Save and offer an 8-second undo that puts back `previous`.
+    @discardableResult private func commit(_ next: [String: LocalAction], todo: Todo, previous: LocalAction?, undoText: String) -> Bool {
         guard persist(next) else { return false }
         let info = UndoInfo(id: todo.id, previous: previous, text: undoText)
         undo = info
@@ -413,6 +566,33 @@ func isoNow() -> String { isoPlain.string(from: Date()) }
     }
     func restore(_ todo: Todo) { set(todo, "active", undoText: "已恢复到待办") }
     func snooze(_ todo: Todo, until: Date, label: String) { set(todo, "snoozed", until: until, undoText: "\(label) 再提醒") }
+    /// “改期限…”: a new deadline, or nil to go back to整理's. Leaves updatedAt alone so platform-sync precedence is unchanged.
+    @discardableResult func setDue(_ todo: Todo, _ date: Date?) -> Bool {
+        let previous = actions[todo.id]
+        var entry = previous ?? LocalAction(status: nil, until: nil, updatedAt: isoNow())
+        entry.dueOverride = date.map(isoLocalText)
+        var next = actions
+        next[todo.id] = entry.isEmpty ? nil : entry
+        let text = date.map { "期限改为 \(dateText($0))" } ?? "已恢复原期限" + (parseDate(todo.due).map { " \(dateText($0))" } ?? "")
+        return commit(next, todo: todo, previous: previous, undoText: text)
+    }
+    var dueChoices: [(label: String, date: Date)] {
+        let start = appCalendar.startOfDay(for: now)
+        let today18 = start.addingTimeInterval(18 * 3600)
+        let monday = snoozeChoices[2].date
+        return (today18 > now ? [("今天 18:00", today18)] : []) + [("明天 18:00", today18.addingTimeInterval(86400)), ("下周一 09:00", monday)]
+    }
+    func task(_ id: String) -> Todo? { inbox.tasks.first { $0.id == id } }
+    /// Which tab shows the card right now.
+    func tab(for todo: Todo) -> Int { ["active": 0, "snoozed": 1][status(todo)] ?? 2 }
+    func requestFocus(_ id: String, complete: Bool = false) {
+        guard task(id) != nil else { return }
+        focus = FocusRequest(id: id, complete: complete)
+    }
+    func setMuted(_ kind: NotifyKind, _ off: Bool) {
+        if off { muted.insert(kind) } else { muted.remove(kind) }
+        persistMuted?(muted); onChange?()
+    }
     func undoLast() {
         guard let info = undo else { return }
         var next = actions; next[info.id] = info.previous
@@ -438,7 +618,7 @@ func isoNow() -> String { isoPlain.string(from: Date()) }
     }
     func handoffPrompt(_ todo: Todo) -> String {
         var lines = ["请接手「别忘了」里的这件事（事项 ID：\(todo.id)）。", "", "事项：\(todo.title)"]
-        if let due = parseDate(todo.due) { lines.append("期限：\(dateText(due, format: "M月d日 HH:mm"))") }
+        if let deadline = due(todo) { lines.append("期限：\(dateText(deadline, format: "M月d日 HH:mm"))" + (hasDueOverride(todo) ? "（我自己改的）" : "")) }
         lines += ["现状：\(todo.detail)", "", "依据："]
         for s in todo.sources.prefix(5) {
             lines.append("- \(s.directionText) · \(s.chat) · \(s.time)：\(s.quote.prefix(240))")
@@ -447,6 +627,70 @@ func isoNow() -> String { isoPlain.string(from: Date()) }
         return lines.joined(separator: "\n")
     }
     func handoffURL(_ todo: Todo) -> URL? { codexNewThreadURL(handoffPrompt(todo)) }
+
+    // MARK: Notifications
+    /// Timed notifications that should be pending: 15 minutes before a personal deadline, and when a snooze ends.
+    /// Identifiers carry the fire time, so a changed time is a new request and an unchanged one is left alone.
+    func scheduledNotices() -> [PlannedNotice] {
+        var out: [PlannedNotice] = []
+        if !muted.contains(.due) {
+            let horizon = now.addingTimeInterval(7 * 86400)
+            for t in items(0) where t.category != "waiting" {
+                guard let d = due(t) else { continue }
+                let fire = d.addingTimeInterval(-15 * 60)
+                guard fire > now && fire < horizon else { continue }
+                out.append(PlannedNotice(identifier: "due-\(t.id)-\(Int(fire.timeIntervalSince1970))", kind: .due, todoId: t.id,
+                                         fireAt: fire, title: "15 分钟后到期", body: t.displayTitle, category: nil))
+            }
+        }
+        if !muted.contains(.snooze) {
+            for t in items(1) {
+                guard let until = actions[t.id]?.until, until > now.timeIntervalSince1970 else { continue }
+                out.append(PlannedNotice(identifier: "snooze-\(t.id)-\(Int(until))", kind: .snooze, todoId: t.id,
+                                         fireAt: Date(timeIntervalSince1970: until), title: "回到待办：\(t.displayTitle)",
+                                         body: "稍后提醒到点了。可以直接完成，或再推 1 小时。", category: NoticeAction.snoozeCategory))
+            }
+        }
+        return out
+    }
+    /// One-off notifications due now. Marks what it returns, so calling again returns nothing new.
+    func takeImmediateNotices() -> [PlannedNotice] {
+        (takeMorningSummary().map { [$0] } ?? []) + takeNudges()
+    }
+    func takeMorningSummary() -> PlannedNotice? {
+        let day = dateText(now, format: "yyyy-MM-dd")
+        guard summaryShownDay != day, todaysFirstRunDone else { return nil }
+        // Handled for the day even when nothing is shown, so a later run never brings a late “morning” summary.
+        summaryShownDay = day; persistSummaryDay?(day)
+        guard !muted.contains(.summary), mineCount > 0 else { return nil }
+        return PlannedNotice(identifier: "summary-\(day)", kind: .summary, todoId: nil, fireAt: nil,
+                             title: "今天的待办", body: morningSummaryText, category: nil)
+    }
+    /// Waiting items that just reached 3 days, once each (recorded as nudgedAt). Daytime only.
+    func takeNudges() -> [PlannedNotice] {
+        let hour = appCalendar.component(.hour, from: now)
+        guard !muted.contains(.nudge), hour >= (appConfig.hours.first ?? 9), hour < 21 else { return [] }
+        let fresh = items(0).filter { canNudge($0) && actions[$0.id]?.nudgedAt == nil }
+        guard !fresh.isEmpty else { return [] }
+        var next = actions
+        let stamp = isoNow()
+        for t in fresh {
+            var entry = next[t.id] ?? LocalAction(status: nil, until: nil, updatedAt: stamp)
+            entry.nudgedAt = stamp
+            next[t.id] = entry
+        }
+        // Not recorded means not shown, so a failed save never turns into repeated notifications.
+        guard persist(next) else { return [] }
+        if fresh.count > 3 {
+            return [PlannedNotice(identifier: "nudge-batch-\(stamp)", kind: .nudge, todoId: nil, fireAt: nil,
+                                  title: "\(fresh.count) 件等回复已满 3 天",
+                                  body: clip(fresh.map { nudgeTarget($0) }.joined(separator: "、"), 120) + "。卡片上可以一键复制催办话。", category: nil)]
+        }
+        return fresh.map { t in
+            PlannedNotice(identifier: "nudge-\(t.id)", kind: .nudge, todoId: t.id, fireAt: nil,
+                          title: "\(nudgeTarget(t)) 的回复已等 \(waitingDays(t) ?? 3) 天", body: t.displayTitle, category: nil)
+        }
+    }
 
     // MARK: Daily report
     /// Everything that became done today, by the user or by整理, newest first.
@@ -540,6 +784,13 @@ let calm = Color(red: 0.32, green: 0.45, blue: 0.70)
     func togglePin() { pinned.toggle(); pinChanged?() }
 }
 
+/// 更新日志.md, bundled as changelog.md by build_app.py. A missing file just means no section and no dot.
+let changelog: [ChangelogEntry] = {
+    guard let url = Bundle.main.url(forResource: "changelog", withExtension: "md"),
+          let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+    return parseChangelog(text)
+}()
+
 func openURL(_ url: URL?) { if let url { NSWorkspace.shared.open(url) } }
 func openDingTalk() { NSWorkspace.shared.open(URL(fileURLWithPath: appConfig.dingtalkAppPath)) }
 
@@ -571,7 +822,7 @@ struct CompletionBurst: View {
     }
 }
 
-enum RowMode { case normal, completing, dismissing }
+enum RowMode { case normal, completing, dismissing, rescheduling }
 
 struct TodoRow: View {
     @ObservedObject var store: TodoStore
@@ -583,15 +834,19 @@ struct TodoRow: View {
     @State private var note = ""
     @State private var celebrating = false
     @State private var finishedReason: String?
+    @State private var flash = false
+    @State private var pickedDue = Date()
+    @State private var copiedNudge = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var status: String { store.status(todo) }
     var archived: Bool { store.isArchived(todo) }
     var shown: CardLength { showAll ? .full : length }
     var dueText: String? {
-        guard let d = parseDate(todo.due), !archived else { return nil }
-        if d < store.now { return "已到期 · " + dateText(d) }
+        guard let d = store.due(todo), !archived else { return nil }
+        let mark = store.hasDueOverride(todo) ? " · 已改" : ""
+        if d < store.now { return "已到期 · " + dateText(d) + mark }
         let today = appCalendar.isDate(d, inSameDayAs: store.now)
-        return (today ? "今天 " : "") + dateText(d, format: today ? "HH:mm" : "M/d HH:mm")
+        return (today ? "今天 " : "") + dateText(d, format: today ? "HH:mm" : "M/d HH:mm") + mark
     }
     var body: some View {
         VStack(alignment: .leading, spacing: shown == .compact ? 6 : 9) {
@@ -621,6 +876,8 @@ struct TodoRow: View {
                 reasonPanel(title: "为什么完成？以后回看时有据可查", reasons: completeReasons) { finish($0) }
             } else if mode == .dismissing {
                 reasonPanel(title: "为什么忽略？整理时会参考，减少同类误判", reasons: dismissReasons) { dismiss($0) }
+            } else if mode == .rescheduling {
+                duePanel
             }
             if shown != .compact {
                 Text(todo.detail).font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3)
@@ -637,6 +894,18 @@ struct TodoRow: View {
         .padding(.horizontal, 13).padding(.vertical, shown == .compact ? 9 : 13)
         .background(celebrating ? accent.opacity(0.09) : Color(nsColor: .controlBackgroundColor).opacity(0.82), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(celebrating ? accent.opacity(0.35) : Color.primary.opacity(0.055), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(warm, lineWidth: 2).opacity(flash ? 1 : 0).allowsHitTesting(false))
+        .onAppear { takeFocus() }
+        .onChange(of: store.focus?.token) { takeFocus() }
+    }
+
+    /// Opened from a notification: highlight this card, and open the reason panel when the notification's “完成” was used.
+    func takeFocus() {
+        guard let f = store.focus, f.id == todo.id, store.highlightedFocus != f.token else { return }
+        store.highlightedFocus = f.token
+        if f.complete && !archived { withAnimation(.snappy(duration: 0.25)) { mode = .completing; note = "" } }
+        withAnimation(.easeOut(duration: 0.2)) { flash = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { withAnimation(.easeOut(duration: 0.6)) { flash = false } }
     }
 
     var checkButton: some View {
@@ -666,6 +935,16 @@ struct TodoRow: View {
                 if todo.category == "waiting" {
                     let days = store.waitingDays(todo) ?? 0
                     badge(days >= 1 ? "等回复 · \(days) 天" : "等回复", days >= 5 ? overdue : .orange)
+                    if store.canNudge(todo) {
+                        Button { copyNudge() } label: {
+                            Label(copiedNudge ? "已复制" : "催一下", systemImage: copiedNudge ? "checkmark" : "hand.wave")
+                                .font(.system(size: 9, weight: .semibold)).foregroundStyle(accent).lineLimit(1).fixedSize()
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(accent.opacity(0.10), in: Capsule()).contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain).help("复制一句催办话，去钉钉粘贴发送；这里不会代发")
+                        .accessibilityLabel("复制催办话：" + todo.displayTitle)
+                    }
                 }
                 if todo.isUnconfirmed { badge("待确认", calm) }
                 if todo.priority == 0 && todo.category != "waiting" { badge("优先", accent) }
@@ -674,7 +953,8 @@ struct TodoRow: View {
             }
             if let dueText {
                 Text(dueText).font(.system(size: 10, weight: .medium))
-                    .foregroundStyle((parseDate(todo.due) ?? .distantFuture) < store.now ? .orange : .secondary).lineLimit(1)
+                    .foregroundStyle(store.isOverdue(todo) ? .orange : .secondary).lineLimit(1)
+                    .help(store.hasDueOverride(todo) ? "你自己改的期限" + (parseDate(todo.due).map { "，原期限 " + dateText($0) } ?? "") : "")
             }
             if let s = todo.sources.first {
                 Text(s.chat).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).layoutPriority(-1)
@@ -692,6 +972,11 @@ struct TodoRow: View {
                         }
                     }
                 }
+                Button("改期限…") {
+                    pickedDue = store.due(todo) ?? store.dueChoices[0].date
+                    withAnimation(.snappy(duration: 0.25)) { mode = .rescheduling }
+                }
+                if store.canNudge(todo) { Button("复制催办话") { copyNudge() } }
                 Button("忽略这条…") { withAnimation(.snappy(duration: 0.25)) { mode = .dismissing; note = "" } }
                 Divider()
                 Button(store.isHandedOff(todo) ? "再交给 Codex…" : "交给 Codex 处理…") {
@@ -733,6 +1018,51 @@ struct TodoRow: View {
         .padding(10).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
         .padding(.leading, 38)
         .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    var duePanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(parseDate(todo.due).map { "改期限 · 整理给的期限：\(dateText($0))" } ?? "改期限 · 整理没有给期限")
+                .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                ForEach(store.dueChoices, id: \.label) { choice in
+                    Button { saveDue(choice.date) } label: {
+                        Text(choice.label).font(.system(size: 11, weight: .medium)).frame(maxWidth: .infinity).padding(.vertical, 6)
+                            .background(accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
+                            .foregroundStyle(accent).contentShape(Rectangle())
+                    }.buttonStyle(.plain).accessibilityLabel("期限改为\(choice.label)：\(todo.displayTitle)")
+                }
+            }
+            HStack(spacing: 8) {
+                DatePicker("期限", selection: $pickedDue, displayedComponents: [.date, .hourAndMinute])
+                    .labelsHidden().datePickerStyle(.field).font(.system(size: 11))
+                    .environment(\.timeZone, appTimeZone).environment(\.calendar, appCalendar)
+                Button("保存") { saveDue(pickedDue) }.font(.system(size: 11)).buttonStyle(.bordered)
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 8) {
+                if store.hasDueOverride(todo) {
+                    Button("清除，恢复原期限") { saveDue(nil) }
+                        .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(accent)
+                }
+                Spacer(minLength: 0)
+                Button("取消") { withAnimation(.snappy(duration: 0.2)) { mode = .normal } }
+                    .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(10).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+        .padding(.leading, 38)
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+    func saveDue(_ date: Date?) {
+        withAnimation(.easeInOut(duration: 0.3)) { if store.setDue(todo, date) { mode = .normal } }
+    }
+    func copyNudge() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(store.nudgeText(todo), forType: .string)
+        withAnimation(.snappy(duration: 0.2)) { copiedNudge = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation(.snappy(duration: 0.2)) { copiedNudge = false } }
     }
 
     func closureBox(_ c: Closure) -> some View {
@@ -928,31 +1258,49 @@ struct MainView: View {
     }
 
     var list: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 9) {
-                if store.items(tab).isEmpty { emptyState }
-                if tab == 0 {
-                    ForEach(store.workGroups()) { group in
-                        groupHeader(group)
-                        if !group.collapsible || confirmExpanded {
-                            ForEach(group.tasks) { todo in TodoRow(store: store, todo: todo, length: length).transition(rowTransition) }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 9) {
+                    if store.items(tab).isEmpty { emptyState }
+                    if tab == 0 {
+                        ForEach(store.workGroups()) { group in
+                            groupHeader(group)
+                            if !group.collapsible || confirmExpanded {
+                                ForEach(group.tasks) { todo in row(todo) }
+                            }
                         }
+                    } else if tab == 2 {
+                        let sections = store.archivedSections(query)
+                        if sections.isEmpty && !store.items(2).isEmpty { noResults }
+                        ForEach(sections, id: \.title) { section in
+                            HStack(spacing: 6) {
+                                Text(section.title).font(.system(size: 12, weight: .semibold))
+                                Text("\(section.tasks.count)").font(.system(size: 10)).foregroundStyle(.secondary)
+                                Spacer()
+                            }.padding(.horizontal, 4).padding(.top, 8)
+                            ForEach(section.tasks) { todo in row(todo) }
+                        }
+                    } else {
+                        ForEach(store.items(tab)) { todo in row(todo) }
                     }
-                } else if tab == 2 {
-                    let sections = store.archivedSections(query)
-                    if sections.isEmpty && !store.items(2).isEmpty { noResults }
-                    ForEach(sections, id: \.title) { section in
-                        HStack(spacing: 6) {
-                            Text(section.title).font(.system(size: 12, weight: .semibold))
-                            Text("\(section.tasks.count)").font(.system(size: 10)).foregroundStyle(.secondary)
-                            Spacer()
-                        }.padding(.horizontal, 4).padding(.top, 8)
-                        ForEach(section.tasks) { todo in TodoRow(store: store, todo: todo, length: length).transition(rowTransition) }
-                    }
-                } else {
-                    ForEach(store.items(tab)) { todo in TodoRow(store: store, todo: todo, length: length).transition(rowTransition) }
-                }
-            }.padding(.horizontal, 14).padding(.bottom, 14)
+                }.padding(.horizontal, 14).padding(.bottom, 14)
+            }
+            .onChange(of: store.focus?.token, initial: true) { jump(proxy) }
+        }
+    }
+    func row(_ todo: Todo) -> some View {
+        TodoRow(store: store, todo: todo, length: length).id(todo.id).transition(rowTransition)
+    }
+    /// Show the card a notification points at: its tab, the 待确认 group if needed, then scroll it into view.
+    func jump(_ proxy: ScrollViewProxy) {
+        guard let f = store.focus, store.scrolledFocus != f.token, let todo = store.task(f.id) else { return }
+        store.scrolledFocus = f.token
+        let target = store.tab(for: todo)
+        if target == 2 { query = "" }
+        if target == 0, store.workGroups().contains(where: { $0.collapsible && $0.tasks.contains { $0.id == todo.id } }) { confirmExpanded = true }
+        withAnimation(.snappy(duration: 0.2)) { tab = target }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(todo.id, anchor: .top) }
         }
     }
 
@@ -1023,11 +1371,24 @@ struct MainView: View {
             }
             .buttonStyle(.plain).help("把今天完成的事带进新的 Codex 对话，整理成日报草稿")
             .accessibilityLabel("整理今天日报，今天完成 \(store.completedToday.count) 件")
-            Button { showSync.toggle() } label: { Image(systemName: "info.circle").font(.system(size: 14)) }
-                .buttonStyle(.plain).foregroundStyle(.secondary).help("上次整理的范围和结果").accessibilityLabel("上次整理详情")
+            Button { showSync.toggle() } label: {
+                Image(systemName: "info.circle").font(.system(size: 14))
+                    .overlay(alignment: .topTrailing) {
+                        if hasNews { Circle().fill(warm).frame(width: 6, height: 6).offset(x: 2, y: -1) }
+                    }
+            }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help(hasNews ? "有新版本，点开看更新日志" : "上次整理、通知设置和更新日志")
+                .accessibilityLabel(hasNews ? "上次整理详情，有新的更新日志" : "上次整理详情")
                 .popover(isPresented: $showSync, arrowEdge: .top) { syncDetail }
+                .onChange(of: showSync) { if showSync, let latest = changelog.first { changelogSeen = latest.title } }
         }.padding(.horizontal, 17).padding(.vertical, 12)
     }
+
+    /// The dot shows once per new changelog version (its newest heading), until ⓘ is opened.
+    @AppStorage("changelogSeen") private var changelogSeen = ""
+    @State private var showAllChangelog = false
+    var hasNews: Bool { changelog.first.map { $0.title != changelogSeen } ?? false }
 
     var syncDetail: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1039,9 +1400,42 @@ struct MainView: View {
                 if store.runURL != nil { Button("打开整理记录") { openURL(store.runURL) } }
                 if let dir = appConfig.projectDirectory { Button("打开项目目录") { openURL(URL(fileURLWithPath: dir)) } }
             }.font(.system(size: 11)).buttonStyle(.bordered)
+            Divider().padding(.vertical, 2)
+            Text("系统通知").font(.system(size: 12, weight: .semibold))
+            ForEach(NotifyKind.allCases) { kind in
+                Toggle(kind.label, isOn: Binding(get: { !store.muted.contains(kind) }, set: { store.setMuted(kind, !$0) }))
+                    .toggleStyle(.checkbox).font(.system(size: 11))
+            }
+            if !changelog.isEmpty {
+                Divider().padding(.vertical, 2)
+                changelogSection
+            }
         }
         .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
         .padding(14).frame(width: 300, alignment: .leading)
+    }
+
+    var changelogSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("更新日志").font(.system(size: 12, weight: .semibold))
+            let entries = showAllChangelog ? changelog : Array(changelog.prefix(3))
+            let content = VStack(alignment: .leading, spacing: 8) {
+                ForEach(entries) { entry in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(entry.title).font(.system(size: 11, weight: .semibold)).foregroundStyle(accent)
+                        ForEach(Array(entry.items.enumerated()), id: \.offset) { _, item in
+                            Text("· " + item).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+            if showAllChangelog { ScrollView { content }.frame(height: 280) } else { content }
+            if changelog.count > 3 {
+                Button(showAllChangelog ? "只看最近 3 条" : "展开全部（\(changelog.count) 条）") {
+                    withAnimation(.snappy(duration: 0.2)) { showAllChangelog.toggle() }
+                }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(accent)
+            }
+        }
     }
 
     var lengthMenu: some View {
@@ -1085,36 +1479,49 @@ struct MainView: View {
     }
 }
 
-/// Local reminder 15 minutes before a personal action is due. Waiting items never notify.
-@MainActor final class DueNotifier {
+/// Delivers the store's planned notifications: timed ones (due, snooze) and one-off ones (morning summary, nudges).
+@MainActor final class Notifier {
     let center = UNUserNotificationCenter.current()
     var authorized = false
-    var signature = ""
+    /// Timed requests added by this process. Delivered ones fall out of the plan, so they are never added twice.
+    var scheduled: Set<String> = []
+    var busy = false
     func start(_ store: TodoStore) {
+        // Rebuilt from inbox and actions on every launch.
+        center.removeAllPendingNotificationRequests()
+        let complete = UNNotificationAction(identifier: NoticeAction.complete, title: "完成", options: [.foreground])
+        let later = UNNotificationAction(identifier: NoticeAction.snoozeHour, title: "再推 1 小时", options: [])
+        center.setNotificationCategories([UNNotificationCategory(identifier: NoticeAction.snoozeCategory, actions: [complete, later],
+                                                                 intentIdentifiers: [], options: [])])
         center.requestAuthorization(options: [.alert, .sound]) { ok, _ in
-            Task { @MainActor in self.authorized = ok; self.signature = ""; self.reschedule(store) }
+            Task { @MainActor in self.authorized = ok; self.refresh(store) }
         }
     }
-    func reschedule(_ store: TodoStore) {
-        guard authorized else { return }
-        let horizon = store.now.addingTimeInterval(7 * 86400)
-        let due = store.items(0).compactMap { t -> (Todo, Date)? in
-            guard t.category != "waiting", let d = parseDate(t.due) else { return nil }
-            let fire = d.addingTimeInterval(-15 * 60)
-            return fire > store.now && fire < horizon ? (t, d) : nil
+    func refresh(_ store: TodoStore) {
+        // Recording a nudge saves actions, which calls back here; the outer call already covers it.
+        guard authorized, !busy else { return }
+        busy = true; defer { busy = false }
+        let now = Date()
+        let plan = store.scheduledNotices().filter { ($0.fireAt ?? now) > now }
+        let wanted = Set(plan.map(\.identifier))
+        let gone = scheduled.subtracting(wanted)
+        if !gone.isEmpty { center.removePendingNotificationRequests(withIdentifiers: Array(gone)) }
+        for notice in plan where !scheduled.contains(notice.identifier) { post(notice) }
+        scheduled = wanted
+        for notice in store.takeImmediateNotices() { post(notice) }
+    }
+    func post(_ notice: PlannedNotice) {
+        let content = UNMutableNotificationContent()
+        content.title = notice.title
+        content.body = notice.body
+        content.sound = .default
+        if let id = notice.todoId { content.userInfo = ["todoId": id] }
+        if let category = notice.category { content.categoryIdentifier = category }
+        // A calendar trigger keeps the exact wall-clock time across sleep.
+        let trigger = notice.fireAt.map {
+            UNCalendarNotificationTrigger(dateMatching: Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: $0), repeats: false)
         }
-        let next = due.map { "\($0.0.id)@\($0.1.timeIntervalSince1970)" }.joined(separator: ",")
-        guard next != signature else { return }
-        signature = next
-        center.removeAllPendingNotificationRequests()
-        for (todo, date) in due {
-            let content = UNMutableNotificationContent()
-            content.title = "15 分钟后到期"
-            content.body = todo.displayTitle
-            content.sound = .default
-            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: max(1, date.addingTimeInterval(-15 * 60).timeIntervalSinceNow), repeats: false)
-            center.add(UNNotificationRequest(identifier: "due-\(todo.id)", content: content, trigger: trigger))
-        }
+        center.add(UNNotificationRequest(identifier: notice.identifier, content: content, trigger: trigger))
     }
 }
 
@@ -1127,7 +1534,7 @@ final class FloatingPanel: NSPanel {
     var statusItem: NSStatusItem!
     var store: TodoStore!
     var settings = WindowSettings()
-    var notifier = DueNotifier()
+    var notifier = Notifier()
     var testMode = false
     func applicationDidFinishLaunching(_ notification: Notification) {
         let args = CommandLine.arguments
@@ -1146,6 +1553,10 @@ final class FloatingPanel: NSPanel {
             if defaults.object(forKey: "seenThrough") == nil { defaults.set(Date().timeIntervalSince1970, forKey: "seenThrough") }
             store.seenThrough = Date(timeIntervalSince1970: defaults.double(forKey: "seenThrough"))
             store.persistSeen = { defaults.set($0.timeIntervalSince1970, forKey: "seenThrough") }
+            store.muted = Set((defaults.stringArray(forKey: "mutedNotifications") ?? []).compactMap(NotifyKind.init(rawValue:)))
+            store.persistMuted = { defaults.set($0.map(\.rawValue).sorted(), forKey: "mutedNotifications") }
+            store.summaryShownDay = defaults.string(forKey: "summaryShownDay")
+            store.persistSummaryDay = { defaults.set($0, forKey: "summaryShownDay") }
         }
         let frame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         panel = FloatingPanel(contentRect: NSRect(x: frame.maxX - 400, y: frame.maxY - 660, width: 374, height: 620),
@@ -1170,7 +1581,7 @@ final class FloatingPanel: NSPanel {
     func updateStatus() {
         statusItem?.button?.title = "✓ \(store.mineCount)" + (store.newCount > 0 ? " · 新\(store.newCount)" : "")
         statusItem?.button?.toolTip = "\(appConfig.appName) · \(store.summaryText)\n点击显示或隐藏，右键更多操作"
-        if !testMode { notifier.reschedule(store) }
+        if !testMode { notifier.refresh(store) }
     }
     @objc func toggle() {
         if NSApp.currentEvent?.type == .rightMouseUp {
@@ -1203,7 +1614,21 @@ final class FloatingPanel: NSPanel {
         [.banner, .sound]
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        await MainActor.run { self.show() }
+        let todoId = response.notification.request.content.userInfo["todoId"] as? String
+        let action = response.actionIdentifier
+        await MainActor.run { self.handleNotification(action: action, todoId: todoId) }
+    }
+    /// “再推 1 小时” snoozes in the background; anything else opens the window on the card.
+    func handleNotification(action: String, todoId: String?) {
+        store.now = Date()
+        // An old notification must not reopen something already completed or dismissed in the window.
+        if action == NoticeAction.snoozeHour, let id = todoId, let todo = store.task(id), !store.isArchived(todo) {
+            store.snooze(todo, until: Date().addingTimeInterval(3600), label: "1 小时后")
+            return
+        }
+        if settings.collapsed { settings.toggleCollapse() }
+        show()
+        if let id = todoId { store.requestFocus(id, complete: action == NoticeAction.complete) }
     }
 }
 @main struct TodoApplication {

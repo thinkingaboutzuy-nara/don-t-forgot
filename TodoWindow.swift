@@ -1056,7 +1056,8 @@ struct TodoRow: View {
                 DatePicker(snoozing ? "回到待办" : "期限", selection: $pickedDue, displayedComponents: [.date, .hourAndMinute])
                     .labelsHidden().datePickerStyle(.field).font(.system(size: 11))
                     .environment(\.timeZone, appTimeZone).environment(\.calendar, appCalendar)
-                Button(snoozing ? "稍后提醒" : "保存") {
+                    .environment(\.locale, Locale(identifier: "zh_CN"))
+                Button("确定") {
                     if snoozing {
                         let label = dateText(pickedDue)
                         withAnimation(.easeInOut(duration: 0.3)) { store.snooze(todo, until: pickedDue, label: label); mode = .normal }

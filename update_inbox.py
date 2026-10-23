@@ -2,7 +2,8 @@
 """Validate and atomically merge an agent-produced task delta. Never edits actions.json.
 
 --dump     full inbox + actions
---open     compact view for a run: open tasks, user feedback, hand-offs, pending report-platform ticks, sync
+--open     compact view for a run: open tasks (with the user's own deadline, if set), user feedback, hand-offs,
+           pending report-platform ticks, sync
 --input    merge a delta; closed tasks older than --archive-days move to archive/
 """
 import argparse, datetime as dt, fcntl, json, os, pathlib, tempfile
@@ -233,13 +234,17 @@ def open_view(root):
                 report_sync.append({'id': t['id'], 'todoId': link['id'], 'expectedVersion': link['version'],
                                     'done': want, 'at': action.get('updatedAt')})
         if status in ['active', 'snoozed']:
-            open_tasks.append({
+            row = {
                 'id': t['id'], 'title': t['title'], 'category': t['category'], 'priority': t['priority'],
                 'due': t.get('due'), 'status': status, 'needsConfirm': t.get('needsConfirm', t['title'].startswith('待确认')),
                 'lastEvidence': max((s['time'] for s in t['sources']), default=None),
                 'conversationIds': sorted({s['conversationId'] for s in t['sources']}),
                 'dispatch': t.get('dispatch'), 'reportTodo': t.get('reportTodo'),
-            })
+            }
+            # The user's own deadline (TodoStore.due shows it first). Runs keep writing `due` from chat and never touch it.
+            if action and action.get('dueOverride'):
+                row['dueOverride'] = action['dueOverride']
+            open_tasks.append(row)
         if action and action.get('status') in ['done', 'dismissed']:
             feedback.append({'id': t['id'], 'title': t['title'], 'status': action['status'],
                              'reason': action.get('reason'), 'note': action.get('note'), 'at': action.get('updatedAt')})

@@ -5,9 +5,17 @@ import json
 import pathlib
 import platform
 import plistlib
+import re
 import shutil
 import subprocess
 import tempfile
+import time
+
+
+def changelog_version(text):
+    """Version = date of the newest `## YYYY-MM-DD` heading in 更新日志.md, e.g. 2026.10.23."""
+    match = re.search(r'^## +(\d{4})-(\d{2})-(\d{2})', text, re.M)
+    return '.'.join(str(int(part)) for part in match.groups()) if match else '1.0'
 
 
 def build(project):
@@ -36,10 +44,15 @@ def build(project):
         (contents / "MacOS").mkdir(parents=True)
         (contents / "Resources").mkdir()
         shutil.copy2(project / "config.json", contents / "Resources/config.json")
+        log = project / "更新日志.md"
+        version = "1.0"
+        if log.exists():
+            shutil.copy2(log, contents / "Resources/changelog.md")
+            version = changelog_version(log.read_text())
         info = {
             "CFBundleDisplayName": name, "CFBundleName": name, "CFBundleExecutable": "TodoWindow",
             "CFBundleIdentifier": config["bundleIdentifier"], "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "1.0", "CFBundleVersion": "1",
+            "CFBundleShortVersionString": version, "CFBundleVersion": time.strftime("%Y%m%d%H%M"),
             "LSMinimumSystemVersion": "14.0", "LSUIElement": True, "NSHighResolutionCapable": True,
         }
         (contents / "Info.plist").write_bytes(plistlib.dumps(info))

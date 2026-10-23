@@ -4,11 +4,12 @@
 python3 tests/ui_snapshot.py --data <dir with inbox.json/actions.json> --out <dir> \
     --steps "click,300,83;wait,0.8;snap,archived;key,cmdf;key,手机;wait,0.6;snap,search"
 
-Steps: snap,<name> | click,<x>,<y from top, points> | key,<text> or key,cmdf | wait,<seconds>.
+Steps: snap,<name> | click,<x>,<y from top, points> | key,<text> or key,cmd<char> (e.g. cmdf, cmd=) | wait,<seconds>.
 The data dir is used as-is, so pass a copy, never the live data directory.
 """
 import argparse
 import pathlib
+import plistlib
 import shutil
 import subprocess
 import tempfile
@@ -32,8 +33,8 @@ import SwiftUI
 }
 @MainActor func key(_ d: AppDelegate, _ text: String) {
     d.panel.makeKey()
-    let command = text == "cmdf"
-    let chars = command ? "f" : text
+    let command = text.hasPrefix("cmd") && text.count == 4
+    let chars = command ? String(text.suffix(1)) : text
     if !command, let editor = d.panel.firstResponder as? NSTextView { editor.insertText(chars, replacementRange: editor.selectedRange()); return }
     if let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: command ? [.command] : [], timestamp: ProcessInfo.processInfo.systemUptime,
                                 windowNumber: d.panel.windowNumber, context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: 3) {
@@ -75,6 +76,11 @@ def run(data, out, steps):
         (tmp / 'harness.swift').write_text(HARNESS)
         bundle = tmp / 'Snapshot.app'
         shutil.copytree(app, bundle, symlinks=True)
+        # Own bundle ID, so card lengths or other preferences changed during a snapshot never reach the real window.
+        info = bundle / 'Contents/Info.plist'
+        plist = plistlib.loads(info.read_bytes())
+        plist['CFBundleIdentifier'] += '.snapshot'
+        info.write_bytes(plistlib.dumps(plist))
         binary = bundle / 'Contents/MacOS/TodoWindow'
         subprocess.run(['swiftc', '-parse-as-library', str(tmp / 'app.swift'), str(tmp / 'harness.swift'), '-o', str(binary),
                         '-framework', 'AppKit', '-framework', 'SwiftUI'], check=True)

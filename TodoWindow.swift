@@ -136,6 +136,14 @@ struct UndoInfo {
     var text: String
 }
 
+/// How much of each card to show; remembered per tab.
+enum CardLength: Int, CaseIterable, Identifiable {
+    case compact, standard, full
+    var id: Int { rawValue }
+    var label: String { ["精简", "标准", "完整"][rawValue] }
+    var hint: String { ["只看标题和一行状态", "多两行说明和依据入口", "全部展开"][rawValue] }
+}
+
 let completeReasons = ["办完了", "对方已处理", "不用做了"]
 let dismissReasons = ["不是我的事", "已在别处跟进", "太琐碎", "重复了"]
 
@@ -146,30 +154,57 @@ private let isoPlain = ISO8601DateFormatter()
 private let localFormats: [DateFormatter] = ["yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"].map {
     let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = appTimeZone; f.dateFormat = $0; return f
 }
+// Parsing is the hot path of every redraw, so each distinct string is parsed once. All callers run on the main thread.
+private var parsedDates: [String: Date?] = [:]
 func parseDate(_ str: String?) -> Date? {
     guard let str, !str.isEmpty else { return nil }
-    if let d = isoFractional.date(from: str) ?? isoPlain.date(from: str) { return d }
-    // Python isoformat() writes microseconds, which ISO8601DateFormatter rejects; trim to milliseconds.
-    if let dot = str.firstIndex(of: "."), let end = str[dot...].firstIndex(where: { "+-Z".contains($0) }), str.distance(from: dot, to: end) > 4 {
-        let trimmed = String(str[..<str.index(dot, offsetBy: 4)]) + str[end...]
-        if let d = isoFractional.date(from: trimmed) { return d }
-    }
-    return localFormats.lazy.compactMap { $0.date(from: str) }.first
+    if let hit = parsedDates[str] { return hit }
+    let value = parseDateUncached(str)
+    parsedDates[str] = value
+    return value
 }
+private func parseDateUncached(_ str: String) -> Date? {
+    guard str.contains("T") else { return localFormats.lazy.compactMap { $0.date(from: str) }.first }
+    // Python isoformat() writes microseconds, which ISO8601DateFormatter rejects; trim to milliseconds first.
+    if let dot = str.firstIndex(of: "."), let end = str[dot...].firstIndex(where: { "+-Z".contains($0) }), str.distance(from: dot, to: end) > 4 {
+        return isoFractional.date(from: String(str[..<str.index(dot, offsetBy: 4)]) + str[end...])
+    }
+    return isoPlain.date(from: str) ?? isoFractional.date(from: str)
+}
+private var formatters: [String: DateFormatter] = [:]
 func dateText(_ date: Date, format: String = "M/d HH:mm") -> String {
+    if let f = formatters[format] { return f.string(from: date) }
     let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.timeZone = appTimeZone; f.dateFormat = format
+    formatters[format] = f
     return f.string(from: date)
 }
-func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
+func isoNow() -> String { isoPlain.string(from: Date()) }
 
 @MainActor final class TodoStore: ObservableObject {
-    @Published var inbox = Inbox(schemaVersion: 1, updatedAt: nil, tasks: [], sync: nil)
-    @Published var actions: [String: LocalAction] = [:]
+    @Published var inbox = Inbox(schemaVersion: 1, updatedAt: nil, tasks: [], sync: nil) { didSet { derived = nil } }
+    @Published var actions: [String: LocalAction] = [:] { didSet { derived = nil } }
     @Published var loadError: String?
     @Published var saveError: String?
     @Published var undo: UndoInfo?
-    @Published var now = Date()
+    @Published var now = Date() { didSet { derived = nil } }
+    /// Items first merged after this moment carry a “新” badge until the user looks at the window.
+    @Published var seenThrough = Date.distantPast
+    var persistSeen: ((Date) -> Void)?
     var onChange: (() -> Void)?
+    /// Everything a redraw needs, computed once per change of inbox, actions or clock.
+    private struct Derived {
+        var status: [String: String] = [:]
+        var closed: [String: Date] = [:]
+        var items: [[Todo]] = [[], [], []]
+        var groups: [WorkGroup] = []
+        var haystack: [String: String] = [:]
+        var sections: [String: [(title: String, tasks: [Todo])]] = [:]
+    }
+    private var derived: Derived?
+    private var cache: Derived {
+        get { if let d = derived { return d }; let d = derive(); derived = d; return d }
+        set { derived = newValue }
+    }
     let root: URL
     private var lastInbox: Data?
     private var timer: Timer?
@@ -219,7 +254,8 @@ func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
     func automatic(_ todo: Todo) -> String {
         todo.category == "resolved" ? "done" : todo.category == "stale" ? "dismissed" : "active"
     }
-    func status(_ todo: Todo) -> String {
+    func status(_ todo: Todo) -> String { cache.status[todo.id] ?? computeStatus(todo) }
+    private func computeStatus(_ todo: Todo) -> String {
         guard let a = actions[todo.id], let s = a.status else { return automatic(todo) }
         if s == "snoozed" { return (a.until ?? 0) > now.timeIntervalSince1970 ? "snoozed" : automatic(todo) }
         // A tick or untick made on the report platform after this manual action wins.
@@ -231,38 +267,52 @@ func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
     func isUrgent(_ todo: Todo) -> Bool {
         todo.priority == 0 || parseDate(todo.due).map { $0 < endOfToday } == true
     }
-    func closedDate(_ todo: Todo) -> Date? {
+    func closedDate(_ todo: Todo) -> Date? { cache.closed[todo.id] ?? computeClosedDate(todo) }
+    private func computeClosedDate(_ todo: Todo) -> Date? {
         if let a = actions[todo.id], ["done", "dismissed"].contains(a.status ?? "") { return parseDate(a.updatedAt) }
         return parseDate(todo.closedAt ?? todo.lastSeen)
     }
-    func items(_ tab: Int) -> [Todo] {
-        let wanted: Set<String> = tab == 0 ? ["active"] : tab == 1 ? ["snoozed"] : ["done", "dismissed"]
-        let rows = inbox.tasks.filter { wanted.contains(status($0)) }
-        if tab == 2 { return rows.sorted { (closedDate($0) ?? .distantPast) > (closedDate($1) ?? .distantPast) } }
-        if tab == 1 { return rows.sorted { (actions[$0.id]?.until ?? 0) < (actions[$1.id]?.until ?? 0) } }
-        return rows.sorted { a, b in
+    func items(_ tab: Int) -> [Todo] { cache.items[tab] }
+    private func derive() -> Derived {
+        var d = Derived()
+        for t in inbox.tasks {
+            d.status[t.id] = computeStatus(t)
+            if let c = computeClosedDate(t) { d.closed[t.id] = c }
+        }
+        let pick = { (wanted: Set<String>) in self.inbox.tasks.filter { wanted.contains(d.status[$0.id] ?? "") } }
+        d.items[0] = pick(["active"]).sorted { a, b in
             if a.priority != b.priority { return a.priority < b.priority }
             return (parseDate(a.due) ?? .distantFuture) < (parseDate(b.due) ?? .distantFuture)
         }
+        d.items[1] = pick(["snoozed"]).sorted { (actions[$0.id]?.until ?? 0) < (actions[$1.id]?.until ?? 0) }
+        d.items[2] = pick(["done", "dismissed"]).sorted { (d.closed[$0.id] ?? .distantPast) > (d.closed[$1.id] ?? .distantPast) }
+        d.groups = computeGroups(d.items[0])
+        return d
     }
     /// Case-insensitive search over everything a closed card shows; every space-separated word must match.
     func matches(_ todo: Todo, _ query: String) -> Bool {
         let words = query.lowercased().split(whereSeparator: \.isWhitespace)
         guard !words.isEmpty else { return true }
-        let a = actions[todo.id]
-        let fields = [todo.title, todo.detail, todo.resolution ?? "", a?.reason ?? "", a?.note ?? ""]
-            + todo.sources.flatMap { [$0.chat, $0.quote, $0.senderName ?? "", $0.recipientName ?? ""] }
-        let haystack = fields.joined(separator: "\n").lowercased()
+        let haystack: String
+        if let hit = cache.haystack[todo.id] { haystack = hit } else {
+            let a = actions[todo.id]
+            let fields = [todo.title, todo.detail, todo.resolution ?? "", a?.reason ?? "", a?.note ?? ""]
+                + todo.sources.flatMap { [$0.chat, $0.quote, $0.senderName ?? "", $0.recipientName ?? ""] }
+            haystack = fields.joined(separator: "\n").lowercased()
+            cache.haystack[todo.id] = haystack
+        }
         return words.allSatisfy { haystack.contains($0) }
     }
     /// Archived cards matching the query, grouped by the day they were closed (newest first).
     func archivedSections(_ query: String) -> [(title: String, tasks: [Todo])] {
+        if let hit = cache.sections[query] { return hit }
         var sections: [(title: String, tasks: [Todo])] = []
         for todo in items(2) where matches(todo, query) {
             let label = dayLabel(closedDate(todo))
             if sections.last?.title == label { sections[sections.count - 1].tasks.append(todo) }
             else { sections.append((label, [todo])) }
         }
+        cache.sections[query] = sections
         return sections
     }
     func dayLabel(_ date: Date?) -> String {
@@ -271,9 +321,10 @@ func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
         if let y = appCalendar.date(byAdding: .day, value: -1, to: now), appCalendar.isDate(date, inSameDayAs: y) { return "昨天" }
         return dateText(date, format: "M月d日")
     }
-    func workGroups() -> [WorkGroup] {
+    func workGroups() -> [WorkGroup] { cache.groups }
+    private func computeGroups(_ active: [Todo]) -> [WorkGroup] {
         var today: [Todo] = [], week: [Todo] = [], waiting: [Todo] = [], confirm: [Todo] = []
-        for todo in items(0) {
+        for todo in active {
             let urgentAction = todo.category != "waiting" && isUrgent(todo)
             // Unconfirmed leads are kept out of the way unless they are urgent personal actions.
             if todo.isUnconfirmed && !urgentAction { confirm.append(todo) }
@@ -291,10 +342,11 @@ func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
     var summaryText: String {
         let groups = Dictionary(uniqueKeysWithValues: workGroups().map { ($0.id, $0.tasks.count) })
         var parts: [String] = []
-        if let n = groups["today"] { parts.append("今天 \(n)") }
-        if let n = groups["week"] { parts.append("本周 \(n)") }
-        if let n = groups["waiting"] { parts.append("等回复 \(n)") }
-        if let n = groups["confirm"] { parts.append("待确认 \(n)") }
+        if newCount > 0 { parts.append("新\(newCount)") }
+        if let n = groups["today"] { parts.append("今天\(n)") }
+        if let n = groups["week"] { parts.append("本周\(n)") }
+        if let n = groups["waiting"] { parts.append("等回复\(n)") }
+        if let n = groups["confirm"] { parts.append("待确认\(n)") }
         return parts.isEmpty ? "眼前没有待办" : parts.joined(separator: " · ")
     }
     func waitingDays(_ todo: Todo) -> Int? {
@@ -302,6 +354,14 @@ func isoNow() -> String { ISO8601DateFormatter().string(from: Date()) }
         let since = parseDate(todo.waitingSince) ?? todo.sources.compactMap { parseDate($0.time) }.min() ?? parseDate(todo.firstSeen)
         guard let since else { return nil }
         return appCalendar.dateComponents([.day], from: appCalendar.startOfDay(for: since), to: appCalendar.startOfDay(for: now)).day
+    }
+    func isNew(_ todo: Todo) -> Bool {
+        status(todo) == "active" && (parseDate(todo.firstSeen).map { $0 > seenThrough } ?? false)
+    }
+    var newCount: Int { items(0).filter(isNew).count }
+    func markSeen(at date: Date = Date()) {
+        guard newCount > 0 else { return }
+        seenThrough = date; persistSeen?(date); onChange?()
     }
     func isHandedOff(_ todo: Todo) -> Bool { todo.dispatch?.threadId != nil || actions[todo.id]?.handoffAt != nil }
     /// Why an archived card is archived. Shown on the card so a past tick can always be explained.
@@ -516,7 +576,9 @@ enum RowMode { case normal, completing, dismissing }
 struct TodoRow: View {
     @ObservedObject var store: TodoStore
     var todo: Todo
+    var length: CardLength = .full
     @State private var expanded = false
+    @State private var showAll = false
     @State private var mode = RowMode.normal
     @State private var note = ""
     @State private var celebrating = false
@@ -524,6 +586,7 @@ struct TodoRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var status: String { store.status(todo) }
     var archived: Bool { store.isArchived(todo) }
+    var shown: CardLength { showAll ? .full : length }
     var dueText: String? {
         guard let d = parseDate(todo.due), !archived else { return nil }
         if d < store.now { return "已到期 · " + dateText(d) }
@@ -531,19 +594,26 @@ struct TodoRow: View {
         return (today ? "今天 " : "") + dateText(d, format: today ? "HH:mm" : "M/d HH:mm")
     }
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: shown == .compact ? 6 : 9) {
             HStack(alignment: .top, spacing: 10) {
                 checkButton
                 VStack(alignment: .leading, spacing: 5) {
                     Text(todo.displayTitle).font(.system(size: 14, weight: .semibold)).lineSpacing(3)
                         .strikethrough(celebrating, color: .secondary)
                         .foregroundStyle(archived || celebrating ? Color.secondary : Color.primary)
+                        .lineLimit(shown == .compact ? 2 : nil)
                         .fixedSize(horizontal: false, vertical: true)
                     if let finishedReason, celebrating {
                         Label("已完成 · \(finishedReason)", systemImage: "checkmark").font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(accent).transition(.opacity.combined(with: .move(edge: .top)))
+                    } else if shown == .compact, let c = store.closure(todo) {
+                        Text(c.headline + (c.when.map { " · " + $0 } ?? "")).font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(accent.opacity(0.85)).lineLimit(1)
                     } else { badges }
                 }
+                .contentShape(Rectangle())
+                .onTapGesture { if length != .full { withAnimation(.snappy(duration: 0.22)) { showAll.toggle() } } }
+                .help(length == .full ? "" : showAll ? "点击收起" : "点击展开这张卡片")
                 Spacer(minLength: 0)
                 moreMenu
             }
@@ -552,17 +622,19 @@ struct TodoRow: View {
             } else if mode == .dismissing {
                 reasonPanel(title: "为什么忽略？整理时会参考，减少同类误判", reasons: dismissReasons) { dismiss($0) }
             }
-            Text(todo.detail).font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3)
-                .lineLimit(archived && !expanded ? 2 : nil)
-                .fixedSize(horizontal: false, vertical: true).padding(.leading, 38)
-            if let c = store.closure(todo) { closureBox(c) }
+            if shown != .compact {
+                Text(todo.detail).font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3)
+                    .lineLimit(shown == .standard || (archived && !expanded) ? 2 : nil)
+                    .fixedSize(horizontal: false, vertical: true).padding(.leading, 38)
+                if let c = store.closure(todo) { closureBox(c) }
+            }
             if status == "snoozed", let until = store.actions[todo.id]?.until {
                 Label("\(dateText(Date(timeIntervalSince1970: until))) 回到待办", systemImage: "clock")
                     .font(.system(size: 10)).foregroundStyle(accent).padding(.leading, 38)
             }
-            evidence
+            if shown != .compact { evidence }
         }
-        .padding(13)
+        .padding(.horizontal, 13).padding(.vertical, shown == .compact ? 9 : 13)
         .background(celebrating ? accent.opacity(0.09) : Color(nsColor: .controlBackgroundColor).opacity(0.82), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(celebrating ? accent.opacity(0.35) : Color.primary.opacity(0.055), lineWidth: 1))
     }
@@ -588,6 +660,7 @@ struct TodoRow: View {
 
     @ViewBuilder var badges: some View {
         HStack(spacing: 6) {
+            if store.isNew(todo) { badge("新", .white, fill: accent).transition(.opacity.combined(with: .scale)) }
             if status == "dismissed" { badge(todo.category == "stale" && store.actions[todo.id]?.status == nil ? "自动收起" : "已忽略", .secondary) }
             if !archived {
                 if todo.category == "waiting" {
@@ -673,7 +746,7 @@ struct TodoRow: View {
                 }
                 if let d = c.detail, !d.isEmpty {
                     Text(d).font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(2)
-                        .lineLimit(expanded ? nil : 3).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(expanded ? nil : shown == .standard ? 1 : 3).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: 0)
@@ -739,9 +812,9 @@ struct TodoRow: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(store.clipboardText(todo), forType: .string)
     }
-    func badge(_ text: String, _ color: Color) -> some View {
+    func badge(_ text: String, _ color: Color, fill: Color? = nil) -> some View {
         Text(text).font(.system(size: 9, weight: .semibold)).foregroundStyle(color).lineLimit(1).fixedSize()
-            .padding(.horizontal, 5).padding(.vertical, 2).background(color.opacity(0.10), in: Capsule())
+            .padding(.horizontal, 5).padding(.vertical, 2).background(fill ?? color.opacity(0.10), in: Capsule())
     }
 }
 
@@ -772,6 +845,17 @@ struct MainView: View {
     @State private var showSync = false
     @State private var query = ""
     @FocusState private var searchFocused: Bool
+    @State private var hovering = false
+    // Per-tab card length: 待办 full, 稍后 standard, 已收起 compact unless the user changes it.
+    @AppStorage("cardLength.0") private var length0 = CardLength.full.rawValue
+    @AppStorage("cardLength.1") private var length1 = CardLength.standard.rawValue
+    @AppStorage("cardLength.2") private var length2 = CardLength.compact.rawValue
+    var length: CardLength { CardLength(rawValue: [length0, length1, length2][tab]) ?? .full }
+    func setLength(_ value: CardLength) {
+        withAnimation(.snappy(duration: 0.25)) {
+            switch tab { case 0: length0 = value.rawValue; case 1: length1 = value.rawValue; default: length2 = value.rawValue }
+        }
+    }
     @AppStorage("confirmGroupExpanded") private var confirmExpanded = false
     var body: some View {
         VStack(spacing: 0) {
@@ -781,11 +865,15 @@ struct MainView: View {
                     tabButton("待办", 0, count: store.items(0).count)
                     tabButton("稍后", 1, count: store.items(1).count)
                     tabButton("已收起", 2, count: store.items(2).count)
-                }.padding(.horizontal, 17).padding(.bottom, 12)
+                    lengthMenu
+                }.padding(.leading, 17).padding(.trailing, 12).padding(.bottom, 12)
                 .background {
-                    // ⌘F jumps to the archive search from any tab.
-                    Button("") { tab = 2; DispatchQueue.main.async { searchFocused = true } }
-                        .keyboardShortcut("f", modifiers: .command).opacity(0).allowsHitTesting(false)
+                    // ⌘F jumps to the archive search; ⌘- / ⌘= shorten or lengthen cards on the current tab.
+                    Group {
+                        Button("") { tab = 2; DispatchQueue.main.async { searchFocused = true } }.keyboardShortcut("f", modifiers: .command)
+                        Button("") { setLength(CardLength(rawValue: max(0, length.rawValue - 1))!) }.keyboardShortcut("-", modifiers: .command)
+                        Button("") { setLength(CardLength(rawValue: min(2, length.rawValue + 1))!) }.keyboardShortcut("=", modifiers: .command)
+                    }.opacity(0).allowsHitTesting(false)
                 }
                 if tab == 2 && !store.items(2).isEmpty { searchField }
                 if loadedConfig == nil { alertBar("缺少 config.json，正在使用默认设置。请交给 Codex 重新构建。") }
@@ -813,6 +901,12 @@ struct MainView: View {
         .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Color.primary.opacity(0.09), lineWidth: 1))
         .tint(accent)
         .animation(.easeInOut(duration: 0.2), value: store.undo?.token)
+        .onHover { inside in
+            hovering = inside
+            guard inside else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { if hovering { withAnimation(.easeOut(duration: 0.4)) { store.markSeen() } } }
+        }
+        .simultaneousGesture(TapGesture().onEnded { withAnimation(.easeOut(duration: 0.4)) { store.markSeen() } })
     }
 
     var header: some View {
@@ -841,7 +935,7 @@ struct MainView: View {
                     ForEach(store.workGroups()) { group in
                         groupHeader(group)
                         if !group.collapsible || confirmExpanded {
-                            ForEach(group.tasks) { todo in TodoRow(store: store, todo: todo).transition(rowTransition) }
+                            ForEach(group.tasks) { todo in TodoRow(store: store, todo: todo, length: length).transition(rowTransition) }
                         }
                     }
                 } else if tab == 2 {
@@ -853,10 +947,10 @@ struct MainView: View {
                             Text("\(section.tasks.count)").font(.system(size: 10)).foregroundStyle(.secondary)
                             Spacer()
                         }.padding(.horizontal, 4).padding(.top, 8)
-                        ForEach(section.tasks) { todo in TodoRow(store: store, todo: todo).transition(rowTransition) }
+                        ForEach(section.tasks) { todo in TodoRow(store: store, todo: todo, length: length).transition(rowTransition) }
                     }
                 } else {
-                    ForEach(store.items(tab)) { todo in TodoRow(store: store, todo: todo).transition(rowTransition) }
+                    ForEach(store.items(tab)) { todo in TodoRow(store: store, todo: todo, length: length).transition(rowTransition) }
                 }
             }.padding(.horizontal, 14).padding(.bottom, 14)
         }
@@ -950,6 +1044,23 @@ struct MainView: View {
         .padding(14).frame(width: 300, alignment: .leading)
     }
 
+    var lengthMenu: some View {
+        Menu {
+            Text("卡片长度（⌘- 缩短，⌘= 加长）")
+            ForEach(CardLength.allCases) { option in
+                Button { setLength(option) } label: {
+                    if option == length { Label("\(option.label)：\(option.hint)", systemImage: "checkmark") }
+                    else { Text("\(option.label)：\(option.hint)") }
+                }
+            }
+        } label: {
+            Image(systemName: ["text.line.first.and.arrowtriangle.forward", "text.alignleft", "text.justify.leading"][length.rawValue])
+                .font(.system(size: 12)).frame(width: 26, height: 28)
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .help("卡片长度：\(length.label)").accessibilityLabel("卡片长度，当前\(length.label)")
+    }
+
     func tabButton(_ text: String, _ value: Int, count: Int) -> some View {
         Button { withAnimation(.snappy(duration: 0.2)) { tab = value } } label: {
             HStack(spacing: 5) { Text(text); Text("\(count)").monospacedDigit().opacity(0.7).contentTransition(.numericText()) }
@@ -1030,6 +1141,12 @@ final class FloatingPanel: NSPanel {
         }
         NSApp.setActivationPolicy(.accessory)
         store = TodoStore(root: root)
+        if !testMode {
+            let defaults = UserDefaults.standard
+            if defaults.object(forKey: "seenThrough") == nil { defaults.set(Date().timeIntervalSince1970, forKey: "seenThrough") }
+            store.seenThrough = Date(timeIntervalSince1970: defaults.double(forKey: "seenThrough"))
+            store.persistSeen = { defaults.set($0.timeIntervalSince1970, forKey: "seenThrough") }
+        }
         let frame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         panel = FloatingPanel(contentRect: NSRect(x: frame.maxX - 400, y: frame.maxY - 660, width: 374, height: 620),
                               styleMask: [.borderless, .nonactivatingPanel, .resizable], backing: .buffered, defer: false)
@@ -1051,7 +1168,7 @@ final class FloatingPanel: NSPanel {
         updateStatus(); panel.orderFrontRegardless()
     }
     func updateStatus() {
-        statusItem?.button?.title = "✓ \(store.mineCount)"
+        statusItem?.button?.title = "✓ \(store.mineCount)" + (store.newCount > 0 ? " · 新\(store.newCount)" : "")
         statusItem?.button?.toolTip = "\(appConfig.appName) · \(store.summaryText)\n点击显示或隐藏，右键更多操作"
         if !testMode { notifier.reschedule(store) }
     }

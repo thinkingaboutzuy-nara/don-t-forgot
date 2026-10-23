@@ -135,8 +135,21 @@ CHECKS = r'''
         expect(found("叶龙") == ["q1"] && found("编码 出入库") == ["q1"] && found("对方已处理") == ["q1"], "matches quote, sender, detail and reason")
         expect(found("codex") == ["q3"] && found("编码 周报").isEmpty, "case-insensitive; all words must match")
         expect(store.archivedSections("").map(\.title) == ["今天", "昨天", "10月20日"], "day sections \(store.archivedSections("").map(\.title))")
+        // “新” badge: merged after seenThrough, only while active; cleared by markSeen
+        store.actions = [:]
+        var fresh = task("n1", "action"); fresh.firstSeen = "2026-10-22T01:00:00.123456+00:00"
+        var older = task("n2", "action"); older.firstSeen = "2026-10-20T01:00:00+00:00"
+        var closedNew = task("n3", "resolved", resolution: "x"); closedNew.firstSeen = "2026-10-22T01:00:00+00:00"
+        store.inbox.tasks = [fresh, older, closedNew]
+        store.seenThrough = parseDate("2026-10-21T00:00:00Z")!
+        var persisted: Date?
+        store.persistSeen = { persisted = $0 }
+        expect(store.isNew(fresh) && !store.isNew(older) && !store.isNew(closedNew) && store.newCount == 1, "new = active and merged after last look")
+        expect(store.summaryText.hasPrefix("新1"), "summary leads with new count \(store.summaryText)")
+        store.markSeen(at: parseDate("2026-10-22T02:00:00Z")!)
+        expect(store.newCount == 0 && persisted == parseDate("2026-10-22T02:00:00Z"), "markSeen clears and persists")
         if failed > 0 { exit(1) }
-        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link and daily report, archive search")
+        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link and daily report, archive search, new badge")
     }
 }
 '''

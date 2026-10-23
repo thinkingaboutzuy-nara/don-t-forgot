@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   check:
     runs-on: macos-15
@@ -34,3 +37,15 @@ jobs:
           name: screenshots
           path: shots/
           if-no-files-found: warn
+      # TEMPORARY: lets the cloud review session read the screenshots via git; remove before merge.
+      - name: Publish screenshots to a temporary branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          git checkout -q --orphan tmp-shots
+          git rm -rfq .
+          cp shots/*.png .
+          git add -- *.png
+          git commit -qm "合成数据截图（临时）"
+          git push -fq origin HEAD:refs/heads/tmp-shots/${{ github.head_ref }}

@@ -35,7 +35,7 @@ jobs:
         run: |
           python3 tests/ui_fixture.py "$RUNNER_TEMP/menu-data"
           python3 tests/ui_snapshot.py --data "$RUNNER_TEMP/menu-data" --out shots --steps \
-            "snap,10-main;rclick,200,330;wait,0.8;menushot,11-right-click-menu;menu,改期限/自定义…;wait,0.8;snap,12-due-custom;click,322,160;wait,0.8;menushot,13-more-menu;menu,稍后提醒/自定义时间…;wait,0.8;snap,14-snooze-custom"
+            "snap,10-main;menudump,200,330;menu,改期限/自定义…;wait,0.8;snap,11-due-custom;menudump,322,160;menu,稍后提醒/自定义时间…;wait,0.8;snap,12-snooze-custom;menudump,200,500;menu,改期限/明天 18:00;wait,0.8;snap,13-due-tomorrow"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

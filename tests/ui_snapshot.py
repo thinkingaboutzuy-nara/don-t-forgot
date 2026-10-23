@@ -6,8 +6,8 @@ python3 tests/ui_snapshot.py --data <dir with inbox.json/actions.json> --out <di
 
 Steps: snap,<name> | click,<x>,<y from top, points> | key,<text> or key,cmd<char> (e.g. cmdf, cmd=) | wait,<seconds>
      | notify,<open|complete|snooze-1h>,<task id> (as if that notification, or its button, was clicked)
-     | rclick,<x>,<y> (right-click) | menushot,<name> (screen capture around the window, for an open menu)
-     | menu,<title>/<title>… (choose that item in the open menu, then close it).
+     | menudump,<x>,<y> (print the right-click menu at that point, without opening it)
+     | menu,<title>/<title>… (choose that item in the last dumped menu).
 snap also saves other visible windows, such as the ⓘ popover, as <name>-window<N>.png.
 The data dir is used as-is, so pass a copy or tests/ui_fixture.py output, never the live data directory.
 """
@@ -39,33 +39,31 @@ import SwiftUI
                                       windowNumber: d.panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) { d.panel.sendEvent(e) }
     }
 }
-@MainActor func rclick(_ d: AppDelegate, _ x: CGFloat, _ yTop: CGFloat) {
+// Menus are read through menu(for:) instead of being popped up: a real menu runs its own tracking loop and stops the script.
+var lastMenu: NSMenu?
+@MainActor func menuDump(_ d: AppDelegate, _ x: CGFloat, _ yTop: CGFloat) {
     let p = NSPoint(x: x, y: d.panel.frame.height - yTop)
-    for type in [NSEvent.EventType.rightMouseDown, .rightMouseUp] {
-        if let e = NSEvent.mouseEvent(with: type, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
-                                      windowNumber: d.panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) { d.panel.sendEvent(e) }
+    guard let content = d.panel.contentView,
+          let event = NSEvent.mouseEvent(with: .rightMouseDown, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                         windowNumber: d.panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else { return }
+    var view = content.hitTest(content.convert(p, from: nil))
+    lastMenu = nil
+    while let v = view, lastMenu == nil { lastMenu = v.menu(for: event); view = v.superview }
+    func lines(_ m: NSMenu, _ depth: Int) -> [String] {
+        m.items.flatMap { item -> [String] in
+            let pad = String(repeating: "  ", count: depth)
+            let me = item.isSeparatorItem ? pad + "────" : pad + item.title + (item.isEnabled ? "" : "（不可用）")
+            return [me] + (item.submenu.map { lines($0, depth + 1) } ?? [])
+        }
     }
-}
-// A menu runs its own tracking loop; later steps still run inside it because the main queue is served in all common modes.
-nonisolated(unsafe) var openMenu: NSMenu?
-@MainActor func menuShot(_ d: AppDelegate, _ name: String) {
-    guard let screen = d.panel.screen ?? NSScreen.main else { return }
-    let f = d.panel.frame.insetBy(dx: -260, dy: -260).intersection(screen.frame)
-    let region = "\(Int(f.minX)),\(Int(screen.frame.maxY - f.maxY)),\(Int(f.width)),\(Int(f.height))"
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-    task.arguments = ["-x", "-R", region, CommandLine.arguments.last! + "/" + name + ".png"]
-    try? task.run(); task.waitUntilExit()
+    print("MENU at \(Int(x)),\(Int(yTop)):\n" + (lastMenu.map { lines($0, 1).joined(separator: "\n") } ?? "  (no menu)"))
 }
 @MainActor func chooseMenu(_ path: String) {
-    guard let top = openMenu else { print("menu step: no open menu"); return }
-    var menu = top
+    guard var menu = lastMenu else { print("menu step: no menu"); return }
     let titles = path.split(separator: "/").map(String.init)
     for (i, title) in titles.enumerated() {
-        guard let index = menu.items.firstIndex(where: { $0.title == title }) else {
-            print("menu step: no item \(title) in \(menu.items.map(\.title))"); top.cancelTracking(); return
-        }
-        if i == titles.count - 1 { top.cancelTracking(); menu.performActionForItem(at: index) }
+        guard let index = menu.items.firstIndex(where: { $0.title == title }) else { print("menu step: no item \(title)"); return }
+        if i == titles.count - 1 { menu.update(); menu.performActionForItem(at: index) }
         else if let sub = menu.items[index].submenu { menu = sub }
     }
 }
@@ -82,12 +80,6 @@ nonisolated(unsafe) var openMenu: NSMenu?
 @main struct Harness {
     @MainActor static func main() {
         let app = NSApplication.shared; let d = AppDelegate(); app.delegate = d
-        NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: nil) { n in
-            if let m = n.object as? NSMenu, m.supermenu == nil { openMenu = m }
-        }
-        NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: nil) { n in
-            if (n.object as? NSMenu) === openMenu { openMenu = nil }
-        }
         var t = 1.5
         for step in (ProcessInfo.processInfo.environment["STEPS"] ?? "").split(separator: ";").map(String.init) {
             let parts = step.split(separator: ",", maxSplits: 2).map(String.init)
@@ -98,8 +90,7 @@ nonisolated(unsafe) var openMenu: NSMenu?
             case "notify": DispatchQueue.main.asyncAfter(deadline: .now() + t) {
                 d.handleNotification(action: parts[1] == "open" ? "com.apple.UNNotificationDefaultActionIdentifier" : parts[1], todoId: parts[2])
             }
-            case "rclick": DispatchQueue.main.asyncAfter(deadline: .now() + t) { rclick(d, CGFloat(Double(parts[1])!), CGFloat(Double(parts[2])!)) }
-            case "menushot": DispatchQueue.main.asyncAfter(deadline: .now() + t) { menuShot(d, parts[1]) }
+            case "menudump": DispatchQueue.main.asyncAfter(deadline: .now() + t) { menuDump(d, CGFloat(Double(parts[1])!), CGFloat(Double(parts[2])!)) }
             case "menu": DispatchQueue.main.asyncAfter(deadline: .now() + t) { chooseMenu(parts[1...].joined(separator: ",")) }
             case "wait": t += Double(parts[1])!
             default: break
@@ -136,7 +127,7 @@ def run(data, out, steps):
                         '-framework', 'AppKit', '-framework', 'SwiftUI'], check=True)
         subprocess.run(['codesign', '--force', '--sign', '-', str(bundle)], check=True, capture_output=True)
         subprocess.run([str(binary), '--test-mode', '--data-dir', str(data), str(out.resolve())],
-                       env={'STEPS': steps, 'PATH': '/usr/bin:/bin'}, check=True)
+                       env={'STEPS': steps, 'PATH': '/usr/bin:/bin'}, check=True, timeout=180)
     print('\n'.join(sorted(str(p) for p in out.glob('*.png'))))
 
 

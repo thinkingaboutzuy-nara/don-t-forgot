@@ -31,6 +31,11 @@ jobs:
           python3 tests/ui_fixture.py "$RUNNER_TEMP/data"
           python3 tests/ui_snapshot.py --data "$RUNNER_TEMP/data" --out shots --steps \
             "snap,01-main;click,349,596;wait,0.8;snap,02-info;click,200,40;wait,0.5;notify,complete,demo-snoozed;wait,1.2;snap,03-notify-complete;notify,open,demo-confirm;wait,1.2;snap,04-notify-confirm;notify,snooze-1h,demo-urgent;wait,0.8;snap,05-snooze-again"
+      - name: Menu screenshots
+        run: |
+          python3 tests/ui_fixture.py "$RUNNER_TEMP/menu-data"
+          python3 tests/ui_snapshot.py --data "$RUNNER_TEMP/menu-data" --out shots --steps \
+            "snap,10-main;menudump,200,330;menu,改期限/自定义…;wait,0.8;snap,11-due-custom;menudump,322,160;menu,稍后提醒/自定义时间…;wait,0.8;snap,12-snooze-custom;menudump,200,500;menu,改期限/明天 18:00;wait,0.8;snap,13-due-tomorrow"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

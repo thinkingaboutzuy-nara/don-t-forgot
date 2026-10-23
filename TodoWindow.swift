@@ -582,6 +582,16 @@ func isoLocalText(_ date: Date) -> String { isoLocal.string(from: date) }
         let monday = snoozeChoices[2].date
         return (today18 > now ? [("今天 18:00", today18)] : []) + [("明天 18:00", today18.addingTimeInterval(86400)), ("下周一 09:00", monday)]
     }
+    /// Menu text that shows the actual moment: “1 小时后（11:53）”, “明天 09:00”, “下周一 09:00（10/26）”.
+    func choiceText(_ label: String, _ date: Date) -> String {
+        let today = appCalendar.isDate(date, inSameDayAs: now)
+        guard label.contains(":") else { return label + "（\(dateText(date, format: today ? "HH:mm" : "M/d HH:mm"))）" }
+        let tomorrow = appCalendar.date(byAdding: .day, value: 1, to: now).map { appCalendar.isDate(date, inSameDayAs: $0) } ?? false
+        return today || tomorrow ? label : label + "（\(dateText(date, format: "M/d"))）"
+    }
+    func restoreDueText(_ todo: Todo) -> String {
+        "恢复原期限（" + (parseDate(todo.due).map { dateText($0) } ?? "没有期限") + "）"
+    }
     func task(_ id: String) -> Todo? { inbox.tasks.first { $0.id == id } }
     /// Which tab shows the card right now.
     func tab(for todo: Todo) -> Int { ["active": 0, "snoozed": 1][status(todo)] ?? 2 }
@@ -822,7 +832,7 @@ struct CompletionBurst: View {
     }
 }
 
-enum RowMode { case normal, completing, dismissing, rescheduling }
+enum RowMode { case normal, completing, dismissing, pickingDue, pickingSnooze }
 
 struct TodoRow: View {
     @ObservedObject var store: TodoStore
@@ -876,8 +886,8 @@ struct TodoRow: View {
                 reasonPanel(title: "为什么完成？以后回看时有据可查", reasons: completeReasons) { finish($0) }
             } else if mode == .dismissing {
                 reasonPanel(title: "为什么忽略？整理时会参考，减少同类误判", reasons: dismissReasons) { dismiss($0) }
-            } else if mode == .rescheduling {
-                duePanel
+            } else if mode == .pickingDue || mode == .pickingSnooze {
+                timePanel
             }
             if shown != .compact {
                 Text(todo.detail).font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3)
@@ -895,6 +905,7 @@ struct TodoRow: View {
         .background(celebrating ? accent.opacity(0.09) : Color(nsColor: .controlBackgroundColor).opacity(0.82), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(celebrating ? accent.opacity(0.35) : Color.primary.opacity(0.055), lineWidth: 1))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(warm, lineWidth: 2).opacity(flash ? 1 : 0).allowsHitTesting(false))
+        .contextMenu { menuItems }
         .onAppear { takeFocus() }
         .onChange(of: store.focus?.token) { takeFocus() }
     }
@@ -963,35 +974,49 @@ struct TodoRow: View {
     }
 
     var moreMenu: some View {
-        Menu {
-            if !archived {
-                if status != "snoozed" {
-                    Menu("稍后提醒") {
-                        ForEach(store.snoozeChoices, id: \.label) { choice in
-                            Button(choice.label) { withAnimation(.easeInOut(duration: 0.3)) { store.snooze(todo, until: choice.date, label: choice.label) } }
+        Menu { menuItems } label: { Image(systemName: "ellipsis").frame(width: 20, height: 24) }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .help("更多操作（也可以在卡片上按右键）").accessibilityLabel("更多操作：" + todo.displayTitle)
+    }
+
+    /// Shared by “…” and the card's right-click menu. Groups: time, moving it forward, reference, then 忽略 alone at the bottom.
+    @ViewBuilder var menuItems: some View {
+        if !archived {
+            if status != "snoozed" {
+                Menu("稍后提醒") {
+                    ForEach(store.snoozeChoices, id: \.label) { choice in
+                        Button(store.choiceText(choice.label, choice.date)) {
+                            withAnimation(.easeInOut(duration: 0.3)) { store.snooze(todo, until: choice.date, label: choice.label) }
                         }
                     }
-                }
-                Button("改期限…") {
-                    pickedDue = store.due(todo) ?? store.dueChoices[0].date
-                    withAnimation(.snappy(duration: 0.25)) { mode = .rescheduling }
-                }
-                if store.canNudge(todo) { Button("复制催办话") { copyNudge() } }
-                Button("忽略这条…") { withAnimation(.snappy(duration: 0.25)) { mode = .dismissing; note = "" } }
-                Divider()
-                Button(store.isHandedOff(todo) ? "再交给 Codex…" : "交给 Codex 处理…") {
-                    openURL(store.handoffURL(todo)); store.markHandoff(todo)
+                    Divider()
+                    Button("自定义时间…") { openTimePanel(.pickingSnooze) }
                 }
             }
-            if archived || status == "snoozed" {
-                Button("恢复到待办") { withAnimation(.easeInOut(duration: 0.3)) { store.restore(todo) } }
+            Menu("改期限") {
+                ForEach(store.dueChoices, id: \.label) { choice in
+                    Button(store.choiceText(choice.label, choice.date)) { saveDue(choice.date) }
+                }
+                Divider()
+                Button("自定义…") { openTimePanel(.pickingDue) }
+                if store.hasDueOverride(todo) { Button(store.restoreDueText(todo)) { saveDue(nil) } }
             }
             Divider()
-            Button("复制待办与来源") { copyToPasteboard() }
-            Button("打开钉钉") { openDingTalk() }
-        } label: { Image(systemName: "ellipsis").frame(width: 20, height: 24) }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-        .help("更多操作").accessibilityLabel("更多操作：" + todo.displayTitle)
+            Button(store.isHandedOff(todo) ? "再交给 Codex…" : "交给 Codex 处理…") {
+                openURL(store.handoffURL(todo)); store.markHandoff(todo)
+            }
+            if store.canNudge(todo) { Button("复制催办话") { copyNudge() } }
+        }
+        if archived || status == "snoozed" {
+            Button("恢复到待办") { withAnimation(.easeInOut(duration: 0.3)) { store.restore(todo) } }
+        }
+        Divider()
+        Button("复制待办与来源") { copyToPasteboard() }
+        Button("打开钉钉") { openDingTalk() }
+        if !archived {
+            Divider()
+            Button("忽略这条…") { withAnimation(.snappy(duration: 0.25)) { mode = .dismissing; note = "" } }
+        }
     }
 
     func reasonPanel(title: String, reasons: [String], choose: @escaping (String) -> Void) -> some View {
@@ -1020,31 +1045,26 @@ struct TodoRow: View {
         .transition(.opacity.combined(with: .move(edge: .top)))
     }
 
-    var duePanel: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(parseDate(todo.due).map { "改期限 · 整理给的期限：\(dateText($0))" } ?? "改期限 · 整理没有给期限")
-                .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-            HStack(spacing: 6) {
-                ForEach(store.dueChoices, id: \.label) { choice in
-                    Button { saveDue(choice.date) } label: {
-                        Text(choice.label).font(.system(size: 11, weight: .medium)).frame(maxWidth: .infinity).padding(.vertical, 6)
-                            .background(accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
-                            .foregroundStyle(accent).contentShape(Rectangle())
-                    }.buttonStyle(.plain).accessibilityLabel("期限改为\(choice.label)：\(todo.displayTitle)")
-                }
-            }
+    /// Date and time for “自定义…” in 改期限 or 稍后提醒; the common choices are already in the menus.
+    var timePanel: some View {
+        let snoozing = mode == .pickingSnooze
+        let title = snoozing ? "稍后提醒 · 选回到待办的时间"
+            : "改期限 · " + (parseDate(todo.due).map { "整理给的期限：\(dateText($0))" } ?? "整理没有给期限")
+        return VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             HStack(spacing: 8) {
-                DatePicker("期限", selection: $pickedDue, displayedComponents: [.date, .hourAndMinute])
+                DatePicker(snoozing ? "回到待办" : "期限", selection: $pickedDue, displayedComponents: [.date, .hourAndMinute])
                     .labelsHidden().datePickerStyle(.field).font(.system(size: 11))
                     .environment(\.timeZone, appTimeZone).environment(\.calendar, appCalendar)
-                Button("保存") { saveDue(pickedDue) }.font(.system(size: 11)).buttonStyle(.bordered)
-                Spacer(minLength: 0)
-            }
-            HStack(spacing: 8) {
-                if store.hasDueOverride(todo) {
-                    Button("清除，恢复原期限") { saveDue(nil) }
-                        .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(accent)
+                    .environment(\.locale, Locale(identifier: "zh_CN"))
+                Button("确定") {
+                    if snoozing {
+                        let label = dateText(pickedDue)
+                        withAnimation(.easeInOut(duration: 0.3)) { store.snooze(todo, until: pickedDue, label: label); mode = .normal }
+                    } else { saveDue(pickedDue) }
                 }
+                .font(.system(size: 11)).buttonStyle(.bordered).keyboardShortcut(.defaultAction)
+                .disabled(snoozing && pickedDue <= Date())
                 Spacer(minLength: 0)
                 Button("取消") { withAnimation(.snappy(duration: 0.2)) { mode = .normal } }
                     .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
@@ -1054,6 +1074,10 @@ struct TodoRow: View {
         .padding(10).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
         .padding(.leading, 38)
         .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+    func openTimePanel(_ next: RowMode) {
+        pickedDue = next == .pickingDue ? (store.due(todo) ?? store.dueChoices[0].date) : store.snoozeChoices[1].date
+        withAnimation(.snappy(duration: 0.25)) { mode = next }
     }
     func saveDue(_ date: Date?) {
         withAnimation(.easeInOut(duration: 0.3)) { if store.setDue(todo, date) { mode = .normal } }

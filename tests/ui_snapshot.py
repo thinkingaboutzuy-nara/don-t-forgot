@@ -5,7 +5,9 @@ python3 tests/ui_snapshot.py --data <dir with inbox.json/actions.json> --out <di
     --steps "click,300,83;wait,0.8;snap,archived;key,cmdf;key,手机;wait,0.6;snap,search"
 
 Steps: snap,<name> | click,<x>,<y from top, points> | key,<text> or key,cmd<char> (e.g. cmdf, cmd=) | wait,<seconds>
-     | notify,<open|complete|snooze-1h>,<task id> (as if that notification, or its button, was clicked).
+     | notify,<open|complete|snooze-1h>,<task id> (as if that notification, or its button, was clicked)
+     | menudump,<x>,<y> (print the right-click menu at that point, without opening it)
+     | menu,<title>/<title>… (choose that item in the last dumped menu).
 snap also saves other visible windows, such as the ⓘ popover, as <name>-window<N>.png.
 The data dir is used as-is, so pass a copy or tests/ui_fixture.py output, never the live data directory.
 """
@@ -37,6 +39,34 @@ import SwiftUI
                                       windowNumber: d.panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) { d.panel.sendEvent(e) }
     }
 }
+// Menus are read through menu(for:) instead of being popped up: a real menu runs its own tracking loop and stops the script.
+var lastMenu: NSMenu?
+@MainActor func menuDump(_ d: AppDelegate, _ x: CGFloat, _ yTop: CGFloat) {
+    let p = NSPoint(x: x, y: d.panel.frame.height - yTop)
+    guard let content = d.panel.contentView,
+          let event = NSEvent.mouseEvent(with: .rightMouseDown, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                         windowNumber: d.panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else { return }
+    var view = content.hitTest(content.convert(p, from: nil))
+    lastMenu = nil
+    while let v = view, lastMenu == nil { lastMenu = v.menu(for: event); view = v.superview }
+    func lines(_ m: NSMenu, _ depth: Int) -> [String] {
+        m.items.flatMap { item -> [String] in
+            let pad = String(repeating: "  ", count: depth)
+            let me = item.isSeparatorItem ? pad + "────" : pad + item.title + (item.isEnabled ? "" : "（不可用）")
+            return [me] + (item.submenu.map { lines($0, depth + 1) } ?? [])
+        }
+    }
+    print("MENU at \(Int(x)),\(Int(yTop)):\n" + (lastMenu.map { lines($0, 1).joined(separator: "\n") } ?? "  (no menu)"))
+}
+@MainActor func chooseMenu(_ path: String) {
+    guard var menu = lastMenu else { print("menu step: no menu"); return }
+    let titles = path.split(separator: "/").map(String.init)
+    for (i, title) in titles.enumerated() {
+        guard let index = menu.items.firstIndex(where: { $0.title == title }) else { print("menu step: no item \(title)"); return }
+        if i == titles.count - 1 { menu.update(); menu.performActionForItem(at: index) }
+        else if let sub = menu.items[index].submenu { menu = sub }
+    }
+}
 @MainActor func key(_ d: AppDelegate, _ text: String) {
     d.panel.makeKey()
     let command = text.hasPrefix("cmd") && text.count == 4
@@ -60,6 +90,8 @@ import SwiftUI
             case "notify": DispatchQueue.main.asyncAfter(deadline: .now() + t) {
                 d.handleNotification(action: parts[1] == "open" ? "com.apple.UNNotificationDefaultActionIdentifier" : parts[1], todoId: parts[2])
             }
+            case "menudump": DispatchQueue.main.asyncAfter(deadline: .now() + t) { menuDump(d, CGFloat(Double(parts[1])!), CGFloat(Double(parts[2])!)) }
+            case "menu": DispatchQueue.main.asyncAfter(deadline: .now() + t) { chooseMenu(parts[1...].joined(separator: ",")) }
             case "wait": t += Double(parts[1])!
             default: break
             }
@@ -95,7 +127,7 @@ def run(data, out, steps):
                         '-framework', 'AppKit', '-framework', 'SwiftUI'], check=True)
         subprocess.run(['codesign', '--force', '--sign', '-', str(bundle)], check=True, capture_output=True)
         subprocess.run([str(binary), '--test-mode', '--data-dir', str(data), str(out.resolve())],
-                       env={'STEPS': steps, 'PATH': '/usr/bin:/bin'}, check=True)
+                       env={'STEPS': steps, 'PATH': '/usr/bin:/bin'}, check=True, timeout=180)
     print('\n'.join(sorted(str(p) for p in out.glob('*.png'))))
 
 

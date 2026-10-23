@@ -88,6 +88,12 @@ CHECKS = r'''
         let choices = Dictionary(uniqueKeysWithValues: store.snoozeChoices.map { ($0.label, $0.date) })
         expect(choices["明天 09:00"] == parseDate("2026-10-22T09:00:00+08:00"), "tomorrow 09:00")
         expect(choices["下周一 09:00"] == parseDate("2026-10-26T09:00:00+08:00"), "next Monday 09:00")
+        // Menu text names the actual moment
+        let menuText = store.snoozeChoices.map { store.choiceText($0.label, $0.date) }
+        expect(menuText == ["1 小时后（11:00）", "明天 09:00", "下周一 09:00（10/26）"], "snooze menu text \(menuText)")
+        expect(store.choiceText("1 小时后", parseDate("2026-10-22T00:30:00+08:00")!) == "1 小时后（10/22 00:30）", "late-night hour names the day")
+        expect(store.restoreDueText(task("x", "action", due: "2026-10-25T18:00:00+08:00")) == "恢复原期限（10/25 18:00）"
+               && store.restoreDueText(task("y", "action")) == "恢复原期限（没有期限）", "restore text shows original deadline")
         // Late run detection (schedule 09:00, 15:00)
         store.inbox.updatedAt = "x"
         store.inbox.sync = SyncInfo(state: "ok", message: nil, scannedThrough: "2026-10-21T09:00:43+08:00", scope: nil, schedule: nil, mode: nil, runThreadId: nil)

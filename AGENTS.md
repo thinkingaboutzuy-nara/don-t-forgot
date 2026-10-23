@@ -14,7 +14,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
 | `使用说明.md` | 给用户看的操作说明 |
 | `更新日志.md` | 用户看得到的改动，按日期倒序；构建时打包为 `changelog.md`，在 ⓘ 里显示，最新标题的日期就是版本号 |
 | `开发计划.md` | 已确认、尚未开始的功能，含做法与验收；做完移到 `更新日志.md` |
-| `tests/` | `verify_store.py`（窗口状态逻辑）、`verify_merge.py`（合并器），都只用临时合成数据；`ui_snapshot.py` 在数据副本上驱动真实窗口截图（含 ⓘ 弹层、模拟点通知），不需要录屏权限；`ui_fixture.py` 生成截图用的合成数据 |
+| `tests/` | `verify_store.py`（窗口状态逻辑）、`verify_merge.py`（合并器），都只用临时合成数据；`ui_snapshot.py` 在数据副本上驱动真实窗口截图（含 ⓘ 弹层、模拟点通知、右键与“…”菜单），不需要录屏权限；`ui_fixture.py` 生成截图用的合成数据 |
 | `.github/workflows/macos-check.yml` | GitHub 上的 PR 检查：在 macOS 上跑两份测试、构建并截图（只用合成数据） |
 | `package_skill.sh` | 重新生成 `技能分享/钉钉待办悬浮窗-skill.zip` |
 | `README.md`、`config.example.json`、`.gitignore` | 仓库首页、配置模板、不进仓库的本机内容清单 |

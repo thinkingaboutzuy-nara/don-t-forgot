@@ -60,6 +60,15 @@ def verify(script):
         inbox = json.loads((root / 'inbox.json').read_text())
         assert inbox['sync']['scannedThrough'] == '2026-10-20T16:00:00+08:00'
 
+        # Sync metadata must match the window's String? fields, even on partial/error runs.
+        for state in ['ok', 'partial', 'error']:
+            rejected(module, root, {'sync': {'state': state, 'scope': {'pages': 57},
+                                             'scannedThrough': '2026-10-21T16:00:00+08:00'}},
+                     f'{state} 的 scope 对象会使窗口解码失败')
+        for field in ['message', 'schedule', 'runThreadId', 'scannedThrough']:
+            rejected(module, root, {'sync': {'state': 'partial', field: 123}}, f'sync.{field} 类型')
+        rejected(module, root, {'sync': []}, 'sync 必须是对象')
+
         # Invalid deltas are rejected atomically
         for field, value in [('category', 'unknown'), ('due', '2026-10-21T09:00:00'), ('waitingSince', 'yesterday'),
                              ('needsConfirm', 'yes')]:

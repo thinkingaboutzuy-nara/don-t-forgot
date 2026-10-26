@@ -193,7 +193,11 @@ def merge(root, payload, archive_days=30):
         inbox['tasks'] = list(rows.values())
 
         delta_sync = payload.get('sync', {})
+        check(isinstance(delta_sync, dict), 'sync 必须是对象')
         sync = {**old.get('sync', {}), **delta_sync}
+        # Match SyncInfo's optional strings before replacing a readable inbox.
+        for field in ['state', 'message', 'scannedThrough', 'scope', 'schedule', 'mode', 'runThreadId']:
+            check(sync.get(field) is None or isinstance(sync[field], str), f'sync.{field} 必须是字符串或 null')
         check(sync.get('state', 'ok') in ['ok', 'partial', 'error'], 'sync.state 无效')
         if sync.get('mode') is not None:
             check(sync['mode'] in ['incremental', 'full'], 'sync.mode 只能是 incremental 或 full')

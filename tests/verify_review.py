@@ -27,6 +27,39 @@ def page(cursor='next', more=True, content='请核对演示事项。'):
                               'senderOpenDingTalkId': 'fixture-person', 'content': content}]}]}}
 
 
+def verify_page_consistency():
+    with tempfile.TemporaryDirectory(prefix='todo-page-proof-') as tmp:
+        tmp = pathlib.Path(tmp); root = tmp / 'data'; runs = tmp / 'runs'
+        config = {'timeZone': 'Asia/Taipei', 'profile': 'fixture:person', 'earliestDate': '2026-10-01', 'verifyMessagePages': True}
+        run = review.start(runs, config, root, '2026-10-20T09:00:00+08:00')['run']
+        partial = page(); full = copy.deepcopy(partial)
+        extra = copy.deepcopy(full['result']['conversationMessagesList'][0]['messages'][0]); extra['openMessageId'] = 'fixture-second'; extra['content'] = '需要跟进的第二件演示事项'
+        full['result']['conversationMessagesList'][0]['messages'].append(extra)
+        assert review.ingest(runs, run, '0', partial)['pages'] == 0
+        assert review.ingest(runs, run, '0', full)['pages'] == 0
+        assert review.ingest(runs, run, '0', full)['pages'] == 1
+        empty_final = {'success': True, 'result': {'hasMore': False, 'conversationMessagesList': []}}
+        assert review.ingest(runs, run, 'next', empty_final)['phase'] == 'fetch'
+        assert review.ingest(runs, run, 'next', empty_final)['phase'] == 'review'
+        assert review.load_run(runs, run)[1]['messageCount'] == 2
+        while True:
+            batch = review.next_chunks(runs, run, 3)['chunks']
+            if not batch: break
+            review.acknowledge(runs, run, [{'id': c['id'], 'sha': c['sha'], 'note': '两条合成业务消息均已完整核对。'} for c in batch])
+        for k in review.load_run(runs, run)[1]['requiredChecks']: review.check_stage(runs, run, k, '本项为合成数据核对，通过，不执行外部写入。')
+        review.finish(runs, run, {'tasks': []}, '合成分页复核通过')
+        witness = review.read(runs / run / 'message-ids.json')
+        assert len(witness) == 2 and all('content' not in m for m in witness)
+        run2 = review.start(runs, config, root, '2026-10-20T10:00:00+08:00')['run']
+        empty_more = {'success': True, 'result': {'hasMore': True, 'nextCursor': 'later', 'conversationMessagesList': []}}
+        review.ingest(runs, run2, '0', empty_more); review.ingest(runs, run2, '0', empty_more)
+        rejects(lambda: review.ingest(runs, run2, '0', empty_more), 'empty continuation must never be accepted')
+        state = review.load_run(runs, run2)[1]
+        assert state['cursor'] == '0' and not state['pages'] and state['pendingPage']['attempts'] == 3
+        assert review.read(root / 'inbox.json')['sync']['scannedThrough'] == '2026-10-20T09:00:00+08:00'
+    print('PASS: partial-page recovery, repeated empty continuation rejection, final-page verification, identity witness')
+
+
 def verify():
     with tempfile.TemporaryDirectory(prefix='todo-review-') as tmp:
         tmp = pathlib.Path(tmp); root = tmp / 'data'; runs = tmp / 'runs'
@@ -116,6 +149,7 @@ def verify():
         assert (runs / followup['run'] / 'review.json').exists(), 'Cleanup must preserve unfinished work'
         assert not path.exists()
         assert review.safe_text('密码: Example123!') .startswith('[登录材料')
+        assert review.safe_text('examplelogin1234').startswith('[登录材料')
         assert review.safe_text('123456').startswith('[登录材料')
         assert review.safe_text('密码在后面 Example123!').startswith('[登录材料')
         assert review.safe_text('https://Example.test/a?x=123Ab!') == '[链接]'
@@ -125,3 +159,4 @@ def verify():
 
 if __name__ == '__main__':
     verify()
+    verify_page_consistency()

@@ -11,5 +11,6 @@
   "earliestDate": "2026-10-01",
   "profile": "<dws profile list 返回的 corpId:userId>",
   "selfOpenDingTalkId": "<本人 openDingTalkId>",
-  "requireReviewReceipt": true
+  "requireReviewReceipt": true,
+  "verifyMessagePages": true
 }

@@ -77,7 +77,8 @@ def progress(state):
             'reviewed': len(state['reviewed']), 'chunks': len(state['chunks']),
             'remainingChecks': [k for k in state['requiredChecks'] if k not in state['checks']],
             'lastProgressAt': state['lastProgressAt'], 'attempts': state['attempts'],
-            'lastError': state.get('lastError')}
+            'lastError': state.get('lastError'),
+            'pageVerification': {k: state.get('pendingPage', {}).get(k) for k in ['attempts', 'confirmations']}}
 
 
 def start(runs, config, root, end=None, full=False):
@@ -120,7 +121,8 @@ def start(runs, config, root, end=None, full=False):
                  'baseline': sync.get('scannedThrough'), 'phase': 'fetch', 'cursor': '0', 'pages': [],
                  'chunks': [], 'reviewed': {}, 'presented': {}, 'checks': {},
                  'requiredChecks': STAGES + ['task:' + t['id'] for t in view['open']],
-                 'attempts': 1, 'lastProgressAt': stamp(), 'createdAt': stamp()}
+                 'attempts': 1, 'lastProgressAt': stamp(), 'createdAt': stamp(),
+                 'verifyMessagePages': config.get('verifyMessagePages', False)}
         save(path / 'open-at-start.json', view)
         save(path / 'review.json', state)
         save(active, {'run': key})
@@ -134,6 +136,8 @@ def safe_text(text):
     if re.search(r'(?:密码|口令|验证码|password|secret|bearer|private.key|access.token)', text, re.I) or re.fullmatch(r'\s*[0-9]{4,8}\s*', text):
         return '[登录材料已移除；需要业务依据时按消息ID另查]'
     text = re.sub(r'(?:https?://|dingtalk://)[^\s\]\)]+', '[链接]', text)
+    if re.fullmatch(r'\s*(?:\d{8,20}\s+)?(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{10,100}\s*', text):
+        return '[登录材料或裸标识已隐藏，按消息ID核对]'
     if re.fullmatch(r'(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9])[\x21-\x7e]{8,120}', text.strip()):
         return '[登录材料已移除]'
     # Attachment transport URLs and media IDs add no readable message content.
@@ -223,9 +227,31 @@ def ingest(runs, key, cursor, response):
         if data['hasMore']:
             nxt = normalized['nextCursor']
             need(nxt and nxt != cursor and all(p['cursor'] != nxt for p in state['pages']), '分页游标没有前进')
+        if state.get('verifyMessagePages'):
+            pending = state.get('pendingPage', {'cursor': cursor, 'attempts': 0, 'union': [], 'confirmations': 0})
+            need(pending['cursor'] == cursor, '分页复核游标不同')
+            merged = {(m['openConversationId'], m['openMessageId']): m for m in pending['union']}
+            merged.update({(m['openConversationId'], m['openMessageId']): m for m in messages})
+            complete_set = {(m['openConversationId'], m['openMessageId']) for m in messages} == set(merged)
+            fingerprint = digest({'messages': sorted(messages, key=lambda m: (m['openConversationId'], m['openMessageId'])), 'hasMore': data['hasMore']})
+            confirmations = (pending['confirmations'] + 1 if pending.get('fingerprint') == fingerprint else 1) if complete_set else 0
+            pending.update(attempts=pending['attempts'] + 1, union=list(merged.values()),
+                           fingerprint=fingerprint, confirmations=confirmations)
+            # Same-cursor reads can silently omit a group half or even the final page.
+            # Do not advance until two full observations agree; an empty continuation is never proof.
+            if confirmations < 2 or (not messages and data['hasMore']):
+                state['pendingPage'] = pending
+                state['lastProgressAt'] = stamp()
+                save(path / 'review.json', state)
+                need(pending['attempts'] < 3, '同一游标3次仍未取得一致完整分页；保留已见消息和原游标，需核对来源，不得跳页')
+                return progress(state)
+            state.pop('pendingPage', None)
         name = f'pages/{len(state["pages"]):04}.json'
         save(path / name, normalized)
-        state['pages'].append({'file': name, 'sha': hashed, 'cursor': cursor})
+        receipt = {'file': name, 'sha': hashed, 'cursor': cursor}
+        if state.get('verifyMessagePages'):
+            receipt['verification'] = {'attempts': pending['attempts'], 'confirmations': pending['confirmations']}
+        state['pages'].append(receipt)
         state['cursor'] = normalized['nextCursor'] if data['hasMore'] else None
         if not data['hasMore']:
             prepare(path, state)
@@ -279,6 +305,8 @@ def check_stage(runs, key, check, note, skipped=False):
 def validate_ready(runs, key, sync, old_sync):
     path, state = load_run(runs, key)
     need(state['phase'] == 'review' and state['cursor'] is None, '尚未完成分页')
+    if state.get('verifyMessagePages'):
+        need(all(p.get('verification', {}).get('confirmations', 0) >= 2 for p in state['pages']), '尚有未经两次一致复核的分页')
     need(set(state['reviewed']) == {c['id'] for c in state['chunks']}, '尚有未审阅的聊天段落')
     need(all(state['reviewed'][c['id']]['sha'] == c['sha'] for c in state['chunks']), '审阅内容身份不一致')
     need(all(k in state['checks'] for k in state['requiredChecks']), '尚有未完成的待办或跨系统核对')
@@ -308,7 +336,7 @@ def finish(runs, key, payload, message):
         path, state = load_run(runs, key)
         root = pathlib.Path(state['root'])
         original_hash = digest(payload)
-        old = read(root / 'inbox.json')
+        old = read(root / 'inbox.json') if (root / 'inbox.json').exists() else {'tasks': [], 'sync': {}}
         # Recover a crash after inbox replace but before the ledger was marked complete.
         already = old.get('sync', {}).get('reviewRunId') == key
         if already:
@@ -334,6 +362,11 @@ def finish(runs, key, payload, message):
         state.update(phase='complete', completedAt=stamp(), lastProgressAt=stamp())
         save(path / 'review.json', state)
         save(path / 'result.json', result)
+        message_file = path / 'messages.json'
+        if message_file.exists():
+            rows = read(message_file)
+            save(path / 'message-ids.json', [{'conversationId': m['openConversationId'], 'messageId': m['openMessageId'], 'time': m['createTime']} for m in rows])
+
         # Successful review only: raw/normalized message bodies are no longer needed.
         for name in ['pages', 'chunks.json', 'messages.json', 'open-at-start.json'] + [p.name for p in path.glob('target-*.json')]:
             target = path / name

@@ -48,6 +48,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
 2. **验证**：运行 `python3 tests/verify_store.py && python3 tests/verify_merge.py && python3 tests/verify_review.py`。界面改动用 `python3 tests/ui_snapshot.py --data <数据副本或 ui_fixture.py 生成的目录> --out <目录> --steps "..."` 截图，只检查受影响的操作；不要指向正式数据目录。
 3. **构建并重启**：运行 `python3 build_app.py`；如有旧的 `别忘了.app.previous`，确认无用后先删除。然后运行 `launchctl kickstart -k gui/$(id -u)/local.vn.dingtalk-todo`。
 4. **改整理规则**：直接改写 `整理规则.md` 的对应条目，不追加补丁段落；定时任务的 prompt 不需要动。
+   - 候选、确认及核对结论使用UTF-8 JSON数据；中文业务正文不嵌进临时Python标准输入源码。必需的转换脚本先保存、编译检查，再读独立JSON。JSON文件及CLI协议明确UTF-8，不依赖排程语系；相关回归在 `verify_review.py` 中覆盖C/ASCII语系完整流程。
 5. **同步到两个远端**（用户要求每次修复都同步）：`git add -A && git commit`，再 `git push origin main && git push github main`。
    - `origin` 是内部 Gitea，`github` 是公开仓库 https://github.com/thinkingaboutzuy-nara/don-t-forgot ，地址见 `git remote -v`。
    - 提交身份已在本仓库设为 GitHub 账号的 noreply 信箱，不要改回公司信箱。

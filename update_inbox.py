@@ -6,10 +6,10 @@
            pending report-platform ticks, sync
 --input    merge a delta; closed tasks older than --archive-days move to archive/
 """
-import argparse, datetime as dt, fcntl, json, os, pathlib, tempfile
+import argparse, datetime as dt, fcntl, json, os, pathlib, sys, tempfile
 
 CONFIG = pathlib.Path(__file__).with_name('config.json')
-DEFAULT = (pathlib.Path(json.loads(CONFIG.read_text())['dataDirectory']).expanduser() if CONFIG.exists()
+DEFAULT = (pathlib.Path(json.loads(CONFIG.read_text(encoding='utf-8'))['dataDirectory']).expanduser() if CONFIG.exists()
            else pathlib.Path.home() / 'Library/Application Support/DingTalkTodo')
 CATEGORIES = ['action', 'waiting', 'resolved', 'stale']
 CLOSED_CATEGORIES = ['resolved', 'stale']
@@ -41,13 +41,13 @@ def parse_aware(value, field):
 def read(path, default):
     if not path.exists():
         return default
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding='utf-8'))
 
 
 def atomic(path, obj):
     fd, name = tempfile.mkstemp(prefix='.' + path.stem + '-', dir=path.parent)
     try:
-        with os.fdopen(fd, 'w') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
@@ -269,6 +269,8 @@ def open_view(root):
 
 
 def main():
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        stream.reconfigure(encoding='utf-8')
     p = argparse.ArgumentParser()
     p.add_argument('--data-dir', type=pathlib.Path, default=DEFAULT)
     p.add_argument('--input', type=pathlib.Path)
@@ -289,7 +291,7 @@ def main():
         config = read(CONFIG, {})
         review_root = (CONFIG.parent / 'work/runs' if config.get('requireReviewReceipt')
                        and a.data_dir.resolve() == DEFAULT.resolve() else None)
-        result = merge(a.data_dir, json.loads(a.input.read_text()), a.archive_days, review_root=review_root)
+        result = merge(a.data_dir, json.loads(a.input.read_text(encoding='utf-8')), a.archive_days, review_root=review_root)
     except DeltaError as e:
         raise SystemExit(f'增量被拒绝，清单未改动：{e}')
     print(json.dumps(result, ensure_ascii=False, indent=2))

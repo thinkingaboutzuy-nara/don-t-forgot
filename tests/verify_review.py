@@ -2,13 +2,58 @@
 """Synthetic interrupted/resumed review, coverage gate and crash recovery checks."""
 import copy
 import json
+import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import review_run as review
 import update_inbox as inbox
+
+
+def verify_utf8_cli():
+    """Exercise the saved-JSON workflow with a non-UTF-8 scheduler locale."""
+    with tempfile.TemporaryDirectory(prefix='todo-encoding-') as tmp:
+        project = pathlib.Path(tmp); root = project / 'data'
+        config = {'timeZone': 'Asia/Taipei', 'profile': 'fixture:person', 'earliestDate': '2026-10-01',
+                  'dataDirectory': str(root), 'verifyMessagePages': True}
+        (project / 'config.json').write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
+        env = dict(os.environ, LC_ALL='C', LANG='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0', PYTHONIOENCODING='ascii')
+        def cli(*args, payload=None, ok=True):
+            p = subprocess.run([sys.executable, str(pathlib.Path(review.__file__)), '--project', str(project), *args],
+                               input=json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None,
+                               capture_output=True, env=env)
+            assert (p.returncode == 0) == ok, (args, p.stderr.decode('utf-8', errors='replace'))
+            return json.loads(p.stdout.decode('utf-8')) if ok else p.stderr.decode('utf-8')
+        run = cli('start', '--end', '2026-10-20T09:00:00+08:00')['run']
+        msg = page('', False, '核对中文候选：引号“测试”、换行\n及表情🙂。')
+        cli('ingest', '--run', run, '--cursor', '0', payload=msg)
+        assert cli('ingest', '--run', run, '--cursor', '0', payload=msg)['phase'] == 'review'
+        for chunk in cli('next', '--run', run)['chunks']:
+            path = project / 'ack.json'
+            path.write_text(json.dumps([{'id': chunk['id'], 'sha': chunk['sha'], 'note': '已阅读中文消息，保留引号、换行及表情。'}], ensure_ascii=False), encoding='utf-8')
+            cli('ack', '--run', run, '--input', str(path))
+        assert cli('start', '--end', '2026-10-20T10:00:00+08:00')['run'] == run
+        for key in review.STAGES:
+            cli('check', '--run', run, '--key', key, '--note', '合成核对已完成，不执行任何外部操作。')
+        task = {'id': 'fixture-utf8', 'title': '确认中文待办🙂', 'detail': '含“引号”和换行\n仍需保留',
+                'category': 'action', 'priority': 1, 'sources': [{'chat': '演示', 'time': '2026-10-20 08:00:00',
+                'quote': '核对中文候选', 'messageId': 'fixture-msg', 'conversationId': 'fixture-chat'}]}
+        delta = project / 'delta.json'
+        delta.write_text(json.dumps({'tasks': [task]}, ensure_ascii=False), encoding='utf-8')
+        bad = project / 'bad.json'; bad.write_bytes(b'{"tasks": []}\xef')
+        cli('finish', '--run', run, '--input', str(bad), '--message', '不得合并损坏的候选', ok=False)
+        assert not (root / 'inbox.json').exists()
+        result = cli('finish', '--run', run, '--input', str(delta), '--message', '中文候选已合并并读回🙂')
+        saved = json.loads((root / 'inbox.json').read_text(encoding='utf-8'))
+        assert saved['tasks'][0]['title'] == task['title'] and saved['tasks'][0]['detail'] == task['detail']
+        assert result['sync']['scannedThrough'] == '2026-10-20T09:00:00+08:00'
+        p = subprocess.run([sys.executable, str(pathlib.Path(inbox.__file__)), '--data-dir', str(root), '--open'], capture_output=True, env=env)
+        assert p.returncode == 0, p.stderr.decode('utf-8', errors='replace')
+        assert json.loads(p.stdout.decode('utf-8'))['open'][0]['title'] == task['title']
+    print('PASS: saved UTF-8 JSON review CLI, non-UTF-8 locale, interruption resume, same-ID merge/readback')
 
 
 def rejects(call, label):
@@ -158,5 +203,6 @@ def verify():
 
 
 if __name__ == '__main__':
+    verify_utf8_cli()
     verify()
     verify_page_consistency()

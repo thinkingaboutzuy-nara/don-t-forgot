@@ -33,7 +33,7 @@ def need(ok, message):
 
 
 def read(path):
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding='utf-8'))
 
 
 def digest(value):
@@ -395,6 +395,9 @@ def prune_completed(runs, keep=6):
 
 
 def main():
+    # Scheduler locale must not change the JSON wire/file encoding.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        stream.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--project', type=pathlib.Path, default=HERE)
     sub = parser.add_subparsers(dest='cmd', required=True)

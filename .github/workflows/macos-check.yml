@@ -18,6 +18,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Merge logic
         run: python3 tests/verify_merge.py
+      - name: Review resume and completion gate
+        run: python3 tests/verify_review.py
       - name: Window state logic
         run: python3 tests/verify_store.py
       - name: Build app

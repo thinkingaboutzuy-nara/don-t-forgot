@@ -15,6 +15,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办。整理由 
 cp config.example.json config.json   # 填写本机路径、dws profile 与本人 ID
 python3 tests/verify_store.py         # 窗口状态逻辑
 python3 tests/verify_merge.py         # 清单合并器
+python3 tests/verify_review.py        # 整理续接与完成检查
 python3 build_app.py                  # 生成并签名 别忘了.app
 ```
 

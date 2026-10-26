@@ -164,7 +164,9 @@ def restore_archived(root, inbox, key):
     return next((r for r in read(root / ref['file'], []) if r['id'] == key), {})
 
 
-def merge(root, payload, archive_days=30):
+def merge(root, payload, archive_days=30, review_root=None):
+    if review_root is None and root.resolve() == DEFAULT.resolve() and read(CONFIG, {}).get("requireReviewReceipt"):
+        review_root = CONFIG.parent / "work/runs"
     root.mkdir(parents=True, exist_ok=True)
     os.chmod(root, 0o700)
     with (root / 'inbox.lock').open('a') as lock:
@@ -207,7 +209,14 @@ def merge(root, payload, archive_days=30):
                 sync['scannedThrough'] = old['sync']['scannedThrough']
             else:
                 sync.pop('scannedThrough', None)
-        if delta_sync.get('state') == 'ok':
+        if delta_sync.get('state') == 'ok' or ('scannedThrough' in delta_sync and delta_sync.get('state') not in ['partial', 'error']):
+            if review_root is not None:
+                from review_run import validate_ready, ReviewError
+                try:
+                    receipt = validate_ready(review_root, sync.get('reviewRunId'), sync, old.get('sync', {}))
+                except (ReviewError, OSError) as error:
+                    raise DeltaError(str(error)) from error
+                check(receipt['root'] == str(root.resolve()), '审阅记录属于另一个数据目录')
             check(sync.get('scannedThrough') and sync.get('scope'), '成功整理必须写 scannedThrough 与 scope')
             scanned = parse_aware(sync['scannedThrough'], 'sync.scannedThrough')
             previous = old.get('sync', {}).get('scannedThrough')
@@ -277,7 +286,10 @@ def main():
     if not a.input:
         p.error('--input、--dump 或 --open 必选其一')
     try:
-        result = merge(a.data_dir, json.loads(a.input.read_text()), a.archive_days)
+        config = read(CONFIG, {})
+        review_root = (CONFIG.parent / 'work/runs' if config.get('requireReviewReceipt')
+                       and a.data_dir.resolve() == DEFAULT.resolve() else None)
+        result = merge(a.data_dir, json.loads(a.input.read_text()), a.archive_days, review_root=review_root)
     except DeltaError as e:
         raise SystemExit(f'增量被拒绝，清单未改动：{e}')
     print(json.dumps(result, ensure_ascii=False, indent=2))

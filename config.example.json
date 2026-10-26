@@ -10,5 +10,6 @@
   "scheduleText": "每天 09:00、15:00 整理",
   "earliestDate": "2026-10-01",
   "profile": "<dws profile list 返回的 corpId:userId>",
-  "selfOpenDingTalkId": "<本人 openDingTalkId>"
+  "selfOpenDingTalkId": "<本人 openDingTalkId>",
+  "requireReviewReceipt": true
 }

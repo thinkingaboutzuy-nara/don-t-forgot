@@ -19,6 +19,17 @@ python3 tests/verify_review.py        # 整理续接与完成检查
 python3 build_app.py                  # 生成并签名 别忘了.app
 ```
 
+## 整理入口
+
+流程分为读取、判断、回填。`review_run.py start`恢复或创建原轮次；fetch阶段用`fetch-command --run <run>`生成原生DWS命令并原样执行，直到进入review。聊天分段完整阅读并ack后，只填写UTF-8判断JSON：summary、tasks中的原ID及变更字段、引用的messageIndexes、checks中的实际核对结论。
+
+```sh
+python3 review_run.py stage --run <run> --input <本轮decisions.json>
+python3 review_run.py finish --run <run>
+```
+
+stage固定保留旧字段与来源、补齐消息依据和方向并生成候选，不写清单；finish检查完整性后合并并同ID读回。无需临时编写业务拼接程序。账号、范围或输入错误会保留原轮次与水位；AI仍需真正阅读和判断，不能用程序自动确认未读消息。
+
 ## 不在仓库里的内容
 
 - `config.json`：本机账号身份和路径

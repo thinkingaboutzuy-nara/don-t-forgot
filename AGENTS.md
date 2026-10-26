@@ -8,7 +8,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
 |---|---|
 | `TodoWindow.swift` | 窗口全部源码。`// MARK: - UI` 以上是数据与状态逻辑（测试只编译这一段），以下是界面 |
 | `update_inbox.py` | inbox 唯一写入口：校验、加锁、原子替换、封存；`--open` 给整理用的精简视图 |
-| `review_run.py` | 整理续接：分页游标、分段审阅、必需核对、同游标消息集合复核、成功凭据与完成后清理 |
+| `review_run.py` | 固定整理入口：按保存的范围生成原生DWS命令、分段审阅、纯JSON判断生成候选/核对、原ID合并与成功凭据 |
 | `build_app.py` | 构建并签名 `别忘了.app`，旧版保留为 `.app.previous` |
 | `config.json` | 本机实例配置（账号、路径、时区、排程、日期下限），构建时打包进 app |
 | `整理规则.md` | 定时整理的唯一现行规则 |
@@ -48,7 +48,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
 2. **验证**：运行 `python3 tests/verify_store.py && python3 tests/verify_merge.py && python3 tests/verify_review.py`。界面改动用 `python3 tests/ui_snapshot.py --data <数据副本或 ui_fixture.py 生成的目录> --out <目录> --steps "..."` 截图，只检查受影响的操作；不要指向正式数据目录。
 3. **构建并重启**：运行 `python3 build_app.py`；如有旧的 `别忘了.app.previous`，确认无用后先删除。然后运行 `launchctl kickstart -k gui/$(id -u)/local.vn.dingtalk-todo`。
 4. **改整理规则**：直接改写 `整理规则.md` 的对应条目，不追加补丁段落；定时任务的 prompt 不需要动。
-   - 候选、确认及核对结论使用UTF-8 JSON数据；中文业务正文不嵌进临时Python标准输入源码。必需的转换脚本先保存、编译检查，再读独立JSON。JSON文件及CLI协议明确UTF-8，不依赖排程语系；相关回归在 `verify_review.py` 中覆盖C/ASCII语系完整流程。
+   - 分页用 `fetch-command --run <run>` 生成的原生DWS命令，不手抄游标。判断写UTF-8 decisions.json，经 `stage --run <run> --input <文件>` 自动保留原字段/来源、按messageIndexes生成消息依据及方向、登记实际核对；`finish --run <run>` 从固定候选完成合并与同ID读回。不再写临时候选拼接脚本。JSON及CLI明确UTF-8，回归覆盖C/ASCII语系完整流程。
 5. **同步到两个远端**（用户要求每次修复都同步）：`git add -A && git commit`，再 `git push origin main && git push github main`。
    - `origin` 是内部 Gitea，`github` 是公开仓库 https://github.com/thinkingaboutzuy-nara/don-t-forgot ，地址见 `git remote -v`。
    - 提交身份已在本仓库设为 GitHub 账号的 noreply 信箱，不要改回公司信箱。

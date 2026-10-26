@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import subprocess
+import shlex
 import sys
 import tempfile
 
@@ -13,12 +14,81 @@ import review_run as review
 import update_inbox as inbox
 
 
+def verify_fixed_candidate():
+    with tempfile.TemporaryDirectory(prefix='todo-candidate-') as tmp:
+        project = pathlib.Path(tmp); root = project / 'data'; runs = project / 'work/runs'
+        config = {'timeZone': 'Asia/Taipei', 'profile': "fixture:person;$(exit 9)", 'earliestDate': '2026-10-01',
+                  'dataDirectory': str(root), 'selfOpenDingTalkId': 'fixture-self', 'verifyMessagePages': True}
+        old = {'id': 'fixture-old', 'title': '核对演示事项', 'detail': '保留原背景', 'category': 'waiting', 'priority': 1,
+               'sources': [{'chat': '旧会话', 'time': '2026-10-20 07:00:00', 'quote': '原依据', 'messageId': 'old-msg', 'conversationId': 'old-chat'}]}
+        inbox.merge(root, {'tasks': [old]})
+        (root / 'actions.json').write_text('{"fixture-old":{"status":"dismissed","reason":"已在别处跟进"}}', encoding='utf-8')
+        manual = (root / 'actions.json').read_bytes(); before = (root / 'inbox.json').read_bytes()
+        run = review.start(runs, config, root, '2026-10-20T09:00:00+08:00')['run']
+        request = review.fetch_command(runs, run, config, project)
+        assert shlex.split(request['command'].splitlines()[1].split(' | ')[0])[-3:] == [config['profile'], '--format', 'json']
+        assert (root / 'inbox.json').read_bytes() == before
+        msg = page('', False)
+        outgoing = copy.deepcopy(msg['result']['conversationMessagesList'][0]['messages'][0])
+        outgoing.update(openMessageId='fixture-msg2', senderOpenDingTalkId='fixture-self', sender='本人')
+        msg['result']['conversationMessagesList'][0]['messages'].append(outgoing)
+        msg['result']['conversationMessagesList'].append({'openConversationId': 'group-chat', 'title': '演示群', 'singleChat': False,
+            'messages': [{**outgoing, 'openConversationId': 'group-chat', 'openMessageId': 'fixture-msg3'}]})
+        review.ingest(runs, run, '0', msg); review.ingest(runs, run, '0', msg)
+        doc = {'summary': '合成候选已核对', 'tasks': [{'id': 'fixture-old', 'appendDetail': '补充新进度', 'messageIndexes': [1, 1]},
+                    {'id': 'fixture-new', 'fields': {'title': '核对群内新要求', 'detail': '已阅读新的独立要求', 'category': 'action', 'priority': 1}, 'messageIndexes': [2, 3]}],
+               'checks': {k: '合成核对已完成，无外部系统操作。' for k in review.load_run(runs, run)[1]['requiredChecks']}}
+        rejects(lambda: review.stage_candidate(runs, run, doc, config), 'unread messages')
+        chunks = review.next_chunks(runs, run, 3)['chunks']
+        review.acknowledge(runs, run, [{'id': chunk['id'], 'sha': chunk['sha'], 'note': '已完整阅读演示新进度，按原ID更新。'} for chunk in chunks])
+        original_state = (runs / run / 'review.json').read_bytes()
+        bad = copy.deepcopy(doc); bad['tasks'][0]['messageIndexes'] = [99]
+        rejects(lambda: review.stage_candidate(runs, run, bad, config), 'unknown source index')
+        assert (runs / run / 'review.json').read_bytes() == original_state
+        assert not (runs / run / 'delta.json').exists()
+        bad = copy.deepcopy(doc); bad['checks']['task:wrong'] = '不可登记不存在的核对事项。'
+        rejects(lambda: review.stage_candidate(runs, run, bad, config), 'unknown check')
+        assert (runs / run / 'review.json').read_bytes() == original_state
+        # Falsy wrong types used to bypass validation and break Swift Inbox decoding.
+        for fields in [{'due': False}, {'waitingSince': False}, {'priority': True}, {'resolution': True},
+                       {'dispatch': {'threadId': False}}, {'detail': []},
+                       {'reportTodo': {'id': 'fixture-report', 'version': 1, 'done': False, 'reportId': False}}]:
+            bad = copy.deepcopy(doc); bad['tasks'][0]['fields'] = fields
+            if 'detail' in fields: bad['tasks'][0].pop('appendDetail')
+            rejects(lambda: review.stage_candidate(runs, run, bad, config), 'typed task fields')
+            assert (runs / run / 'review.json').read_bytes() == original_state
+            assert not (runs / run / 'delta.json').exists()
+        bad = copy.deepcopy(doc)
+        bad['tasks'][0]['sources'] = [{**old['sources'][0], 'messageId': 'bad-direction', 'recipientName': False}]
+        rejects(lambda: review.stage_candidate(runs, run, bad, config), 'typed source direction')
+        assert (root / 'inbox.json').read_bytes() == before
+        review.stage_candidate(runs, run, doc, config)
+        candidate = review.read(runs / run / 'delta.json')
+        t = candidate['tasks'][0]
+        assert t['title'] == old['title'] and t['detail'] == '保留原背景\n补充新进度'
+        assert len(t['sources']) == 2 and t['sources'][0] == old['sources'][0]
+        assert t['sources'][1]['messageId'] == 'fixture-msg' and t['sources'][1]['recipientName'] == '我'
+        assert candidate['tasks'][1]['sources'][0]['recipientName'] == '演示'
+        assert candidate['tasks'][1]['sources'][1]['recipientName'] == '演示群'
+        assert candidate['tasks'][1]['sources'][1]['conversationType'] == 'group'
+        assert (root / 'inbox.json').read_bytes() == before, 'stage must not publish'
+        resumed = review.start(runs, config, root, '2026-10-20T10:00:00+08:00')
+        assert resumed['run'] == run and not resumed['remainingChecks']
+        edited = copy.deepcopy(candidate); edited['tasks'][0]['detail'] = '绕过候选修改'
+        rejects(lambda: review.finish(runs, run, edited, doc['summary']), 'changed staged candidate')
+        review.finish(runs, run, candidate, doc['summary'])
+        assert (root / 'actions.json').read_bytes() == manual
+        assert [t['id'] for t in inbox.open_view(root)['open']] == ['fixture-new'], 'manual dismissal remains effective'
+        assert review.read(root / 'inbox.json')['tasks'][0]['sources'][1]['senderId'] == 'fixture-person'
+    print('PASS: fixed JSON candidate, source mapping/dedup, input rejection, resume, manual state, staged hash')
+
+
 def verify_utf8_cli():
     """Exercise the saved-JSON workflow with a non-UTF-8 scheduler locale."""
     with tempfile.TemporaryDirectory(prefix='todo-encoding-') as tmp:
         project = pathlib.Path(tmp); root = project / 'data'
         config = {'timeZone': 'Asia/Taipei', 'profile': 'fixture:person', 'earliestDate': '2026-10-01',
-                  'dataDirectory': str(root), 'verifyMessagePages': True}
+                  'dataDirectory': str(root), 'selfOpenDingTalkId': 'fixture-self', 'verifyMessagePages': True}
         (project / 'config.json').write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
         env = dict(os.environ, LC_ALL='C', LANG='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0', PYTHONIOENCODING='ascii')
         def cli(*args, payload=None, ok=True):
@@ -43,10 +113,16 @@ def verify_utf8_cli():
                 'quote': '核对中文候选', 'messageId': 'fixture-msg', 'conversationId': 'fixture-chat'}]}
         delta = project / 'delta.json'
         delta.write_text(json.dumps({'tasks': [task]}, ensure_ascii=False), encoding='utf-8')
+        document = {'summary': '中文候选已合并并读回🙂', 'tasks': [{'id': task['id'],
+                    'fields': {k: v for k, v in task.items() if k not in ['id', 'sources']}, 'messageIndexes': [1]}],
+                    'checks': {k: '合成核对已完成，不执行任何外部操作。' for k in review.STAGES}}
+        decisions = project / 'decisions.json'
+        decisions.write_text(json.dumps(document, ensure_ascii=False), encoding='utf-8')
+        cli('stage', '--run', run, '--input', str(decisions))
         bad = project / 'bad.json'; bad.write_bytes(b'{"tasks": []}\xef')
         cli('finish', '--run', run, '--input', str(bad), '--message', '不得合并损坏的候选', ok=False)
         assert not (root / 'inbox.json').exists()
-        result = cli('finish', '--run', run, '--input', str(delta), '--message', '中文候选已合并并读回🙂')
+        result = cli('finish', '--run', run)
         saved = json.loads((root / 'inbox.json').read_text(encoding='utf-8'))
         assert saved['tasks'][0]['title'] == task['title'] and saved['tasks'][0]['detail'] == task['detail']
         assert result['sync']['scannedThrough'] == '2026-10-20T09:00:00+08:00'
@@ -203,6 +279,7 @@ def verify():
 
 
 if __name__ == '__main__':
+    verify_fixed_candidate()
     verify_utf8_cli()
     verify()
     verify_page_consistency()

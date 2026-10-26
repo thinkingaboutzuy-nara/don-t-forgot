@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Resumable local review ledger. Receives dws JSON; never invokes an external API.
 
-start -> ingest each cursor -> next/ack each bounded text chunk -> check -> finish.
+start -> fetch-command / native dws -> next/ack -> stage decisions.json -> finish.
+The fixed stage command preserves existing fields/sources and maps messageIndexes
+to source IDs and direction. Decisions: summary, tasks [{id, fields?, appendDetail?,
+messageIndexes?, sources?}], checks {requiredKey: note or {note, skipped}}, sync?.
 Only finish may publish successful coverage. A partial run keeps its data and cursor.
 """
 import argparse
+import copy
 import collections
 import contextlib
 import datetime as dt
@@ -14,6 +18,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import sys
 from zoneinfo import ZoneInfo
@@ -302,6 +307,111 @@ def check_stage(runs, key, check, note, skipped=False):
         return progress(state)
 
 
+def verify_identity(state, config):
+    identity = digest({'profile': config['profile'], 'root': str(pathlib.Path(config['dataDirectory']).expanduser().resolve()), 'zone': config['timeZone']})
+    need(state['identity'] == identity, '本轮账号、时区或数据目录已改变，不能接错任务')
+
+
+def fetch_command(runs, key, config, project):
+    """Print one native dws invocation. Never runs an API or a background loop."""
+    _, state = load_run(runs, key)
+    verify_identity(state, config)
+    need(state['phase'] == 'fetch' and state['cursor'] is not None, '本轮分页已结束，按当前阶段继续审阅')
+    zone = ZoneInfo(config['timeZone'])
+    local = lambda value: dt.datetime.fromisoformat(value).astimezone(zone).strftime('%Y-%m-%d %H:%M:%S')
+    native = ['dws', 'chat', 'message', 'list-all', '--start', local(state['start']), '--end', local(state['end']),
+              '--limit', '100', '--cursor', state['cursor'], '--profile', config['profile'], '--format', 'json']
+    receiver = [sys.executable, str(project.resolve() / 'review_run.py'), '--project', str(project.resolve()),
+                'ingest', '--run', key, '--cursor', state['cursor']]
+    return {'run': key, 'cursor': state['cursor'], 'command': 'set -o pipefail\n' + shlex.join(native) + ' | ' + shlex.join(receiver)}
+
+
+def stage_candidate(runs, key, document, config):
+    """Turn reviewed JSON decisions into a validated delta; never edits inbox/actions."""
+    from update_inbox import validate_task
+    with locked(runs):
+        path, state = load_run(runs, key)
+        verify_identity(state, config)
+        need(state['phase'] == 'review' and state['cursor'] is None, '先完成分页与全文阅读')
+        need(set(state['reviewed']) == {c['id'] for c in state['chunks']}, '先完整阅读本轮所有段落')
+        need(isinstance(document, dict) and not (set(document) - {'tasks', 'checks', 'summary', 'sync'}), '判断JSON包含无效字段')
+        summary = document.get('summary')
+        need(isinstance(summary, str) and 1 <= len(summary) <= 2000, '提供本轮实际变化摘要')
+        edits = document.get('tasks', [])
+        checks = document.get('checks', {})
+        sync = document.get('sync', {})
+        need(isinstance(edits, list) and isinstance(checks, dict), 'tasks须为数组，checks须为对象')
+        need(isinstance(sync, dict) and not (set(sync) - {'schedule', 'runThreadId'}) and all(isinstance(v, str) for v in sync.values()), 'sync只接受排程和原对话ID字符串')
+        checked = {}
+        for name, value in checks.items():
+            need(name in state['requiredChecks'], '不存在的核对项目：' + name)
+            need(isinstance(value, (str, dict)), '核对说明须为文字或note/skipped对象')
+            if isinstance(value, dict):
+                need(not (set(value) - {'note', 'skipped'}), '核对说明包含无效字段')
+            note = value if isinstance(value, str) else value.get('note')
+            skipped = False if isinstance(value, str) else value.get('skipped', False)
+            need(isinstance(note, str) and 10 <= len(note) <= 3000, '核对说明须包含实际依据与结论')
+            need(type(skipped) is bool and (not skipped or name == 'report'), '只有日报服务不可用可记为跳过')
+            checked[name] = {'note': note, 'skipped': skipped, 'at': stamp()}
+        root = pathlib.Path(state['root'])
+        box = read(root / 'inbox.json') if (root / 'inbox.json').exists() else {'tasks': [], 'sync': {}}
+        need(box.get('sync', {}).get('scannedThrough') == state['baseline'], '成功水位已变化，不能覆盖其他轮次')
+        current = {t['id']: t for t in box['tasks']}
+        rows = {m['index']: m for m in read(path / 'messages.json')}
+        self_id = config.get('selfOpenDingTalkId')
+        need(isinstance(self_id, str) and self_id, '缺少已核实的本人ID')
+        allowed = {'title', 'detail', 'category', 'priority', 'due', 'waitingSince', 'needsConfirm', 'resolution', 'reportTodo', 'dispatch'}
+        tasks, seen = [], set()
+        for edit in edits:
+            need(isinstance(edit, dict) and not (set(edit) - {'id', 'fields', 'appendDetail', 'messageIndexes', 'sources'}), '事项判断包含无效字段')
+            ident = edit.get('id')
+            need(isinstance(ident, str) and 1 <= len(ident) <= 160, '提供原事项或新事项的稳定ID')
+            fields = edit.get('fields', {})
+            need(isinstance(fields, dict) and not (set(fields) - allowed), 'fields包含无效事项字段')
+            previous = current.get(ident)
+            archived = next((a for a in box.get('archived', []) if a['id'] == ident), None)
+            if previous is None and archived:
+                previous = next((t for t in read(root / archived['file']) if t['id'] == ident), None)
+                need(previous is not None, '原ID的封存事项不存在')
+            task = copy.deepcopy(previous) if previous else {'id': ident, 'sources': []}
+            task.update(fields)
+            if 'appendDetail' in edit:
+                extra = edit['appendDetail']
+                need(isinstance(extra, str) and 'detail' not in fields, 'appendDetail须为文字，且不能同时覆盖detail')
+                task['detail'] = '\n'.join(v for v in [task.get('detail', ''), extra] if v)
+            indices, explicit = edit.get('messageIndexes', []), edit.get('sources', [])
+            need(isinstance(indices, list) and isinstance(explicit, list), 'messageIndexes与sources须为数组')
+            sources = copy.deepcopy(explicit)
+            need(all(isinstance(s, dict) for s in sources), '每条来源须为对象')
+            for index in indices:
+                need(type(index) is int and index in rows, '引用了本轮不存在的消息索引')
+                m = rows[index]
+                kind = 'direct' if m['singleChat'] is True else 'group' if m['singleChat'] is False else 'unknown'
+                recipient = ('我' if m['senderOpenDingTalkId'] != self_id else m['chatTitle']) if kind == 'direct' else m['chatTitle']
+                sources.append({'chat': m['chatTitle'], 'time': m['createTime'], 'quote': message_body(m)[:600],
+                                'messageId': m['openMessageId'], 'conversationId': m['openConversationId'],
+                                'senderName': m['sender'], 'senderId': m['senderOpenDingTalkId'],
+                                'recipientName': recipient, 'conversationType': kind})
+            source_keys = {(s['conversationId'], s['messageId']) for s in task['sources']}
+            for source in sources:
+                need(all(isinstance(source.get(k), str) for k in ['chat', 'time', 'quote', 'messageId', 'conversationId']), '来源缺少稳定身份、时间或正文')
+                source['quote'] = safe_text(source['quote'])[:600]
+                source_key = (source['conversationId'], source['messageId'])
+                if source_key not in source_keys:
+                    task['sources'].append(source); source_keys.add(source_key)
+            validate_task(task, seen)
+            tasks.append(task)
+        payload = {'tasks': tasks, 'sync': {**sync, 'message': summary}}
+        # Validate the entire document before recording anything. Crash/retry is idempotent.
+        save(path / 'delta.json', payload)
+        state['checks'].update(checked)
+        state['candidateHash'] = digest(payload)
+        state['lastProgressAt'] = stamp()
+        save(path / 'review.json', state)
+        return {'progress': progress(state), 'candidate': str(path / 'delta.json'), 'taskCount': len(tasks),
+                'taskIds': [t['id'] for t in tasks], 'candidateHash': state['candidateHash']}
+
+
 def validate_ready(runs, key, sync, old_sync):
     path, state = load_run(runs, key)
     need(state['phase'] == 'review' and state['cursor'] is None, '尚未完成分页')
@@ -336,6 +446,7 @@ def finish(runs, key, payload, message):
         path, state = load_run(runs, key)
         root = pathlib.Path(state['root'])
         original_hash = digest(payload)
+        need(not state.get('candidateHash') or state['candidateHash'] == original_hash, '候选在登记后改变，须重新stage核对，不能直接合并')
         old = read(root / 'inbox.json') if (root / 'inbox.json').exists() else {'tasks': [], 'sync': {}}
         # Recover a crash after inbox replace but before the ledger was marked complete.
         already = old.get('sync', {}).get('reviewRunId') == key
@@ -402,14 +513,14 @@ def main():
     parser.add_argument('--project', type=pathlib.Path, default=HERE)
     sub = parser.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('start'); p.add_argument('--end'); p.add_argument('--full', action='store_true')
-    for cmd in ['status', 'ingest', 'next', 'ack', 'check', 'finish', 'fail']:
+    for cmd in ['status', 'fetch-command', 'ingest', 'next', 'ack', 'check', 'stage', 'finish', 'fail']:
         p = sub.add_parser(cmd); p.add_argument('--run', required=True)
         if cmd == 'ingest': p.add_argument('--cursor', required=True)
         if cmd == 'next': p.add_argument('--count', type=int, default=1)
-        if cmd in ['ack', 'finish']: p.add_argument('--input', type=pathlib.Path, required=True)
+        if cmd in ['ack', 'stage', 'finish']: p.add_argument('--input', type=pathlib.Path, required=cmd != 'finish')
         if cmd == 'check':
             p.add_argument('--key', required=True); p.add_argument('--note', required=True); p.add_argument('--skipped', action='store_true')
-        if cmd == 'finish': p.add_argument('--message', required=True)
+        if cmd == 'finish': p.add_argument('--message')
         if cmd == 'fail': p.add_argument('--reason', required=True)
     args = parser.parse_args(); runs = args.project / 'work/runs'
     try:
@@ -417,12 +528,16 @@ def main():
             config = read(args.project / 'config.json')
             value = start(runs, config, pathlib.Path(config['dataDirectory']).expanduser(), args.end, args.full)
         elif args.cmd == 'status': value = progress(load_run(runs, args.run)[1])
+        elif args.cmd == 'fetch-command': value = fetch_command(runs, args.run, read(args.project / 'config.json'), args.project)
         elif args.cmd == 'ingest': value = ingest(runs, args.run, args.cursor, json.load(sys.stdin))
         elif args.cmd == 'next': value = next_chunks(runs, args.run, args.count)
         elif args.cmd == 'ack': value = acknowledge(runs, args.run, read(args.input))
         elif args.cmd == 'check': value = check_stage(runs, args.run, args.key, args.note, args.skipped)
+        elif args.cmd == 'stage': value = stage_candidate(runs, args.run, read(args.input), read(args.project / 'config.json'))
         elif args.cmd == 'fail': value = record_failure(runs, args.run, args.reason)
-        else: value = finish(runs, args.run, read(args.input), args.message)
+        else:
+            payload = read(args.input or run_path(runs, args.run) / 'delta.json')
+            value = finish(runs, args.run, payload, args.message or payload.get('sync', {}).get('message', '本轮整理已完成'))
     except (ReviewError, ValueError, OSError) as e:
         raise SystemExit(f'整理未完成，原进度保留：{e}')
     print(json.dumps(value, ensure_ascii=False, indent=2))

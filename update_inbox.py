@@ -97,27 +97,36 @@ def validate_task(t, seen):
     for field in ['title', 'detail', 'category', 'priority', 'sources']:
         check(field in t, f'{key} 缺少 {field}')
     check(t['category'] in CATEGORIES, f'{key} 的 category 无效：{t["category"]!r}')
-    check(t['priority'] in [0, 1, 2], f'{key} 的 priority 无效')
+    check(type(t['priority']) is int and t['priority'] in [0, 1, 2], f'{key} 的 priority 须为0、1或2的整数')
     check(isinstance(t['title'], str) and 1 <= len(t['title']) <= 140, f'{key} 的 title 长度无效')
-    check(isinstance(t['detail'], str) and len(t['detail']) <= 3000, f'{key} 的 detail 过长')
+    check(isinstance(t['detail'], str) and len(t['detail']) <= 3000, f'{key} 的 detail 须为不超过3000字的文字')
     check(isinstance(t['sources'], list) and t['sources'], f'{key} 必须有依据')
     for s in t['sources']:
+        check(isinstance(s, dict), f'{key} 的每条来源须为对象')
         for field in ['chat', 'time', 'quote', 'messageId', 'conversationId']:
             check(isinstance(s.get(field), str), f'{key} 的来源缺少 {field}')
         check(len(s['quote']) <= 600, f'{key} 的来源引用超过 600 字')
-    if t.get('due'):
+        for field in ['senderName', 'senderId', 'recipientName', 'conversationType']:
+            check(s.get(field) is None or isinstance(s[field], str), f'{key} 的来源 {field} 须为文字或null')
+    for field in ['due', 'waitingSince', 'resolution', 'firstSeen', 'lastSeen', 'closedAt']:
+        check(t.get(field) is None or isinstance(t[field], str), f'{key}.{field} 须为文字或null')
+    if t.get('due') is not None:
         parse_aware(t['due'], f'{key}.due')
-    if t.get('waitingSince'):
+    if t.get('waitingSince') is not None:
         parse_aware(t['waitingSince'], f'{key}.waitingSince')
     if 'needsConfirm' in t:
         check(isinstance(t['needsConfirm'], bool), f'{key}.needsConfirm 必须是布尔值')
     if 'dispatch' in t:
         check(t['dispatch'] is None or isinstance(t['dispatch'], dict), f'{key}.dispatch 必须是对象')
+        for field in ['threadId', 'title', 'status']:
+            check(t['dispatch'] is None or t['dispatch'].get(field) is None or isinstance(t['dispatch'][field], str), f'{key}.dispatch.{field} 须为文字或null')
     if t.get('reportTodo') is not None:
         r = t['reportTodo']
         check(isinstance(r, dict) and isinstance(r.get('id'), str) and r['id'], f'{key}.reportTodo 须有平台待办 id')
         check(type(r.get('version')) is int and type(r.get('done')) is bool, f'{key}.reportTodo 须有整数 version 与布尔 done')
-        if r.get('changedAt'):
+        for field in ['reportId', 'workDate', 'changedAt']:
+            check(r.get(field) is None or isinstance(r[field], str), f'{key}.reportTodo.{field} 须为文字或null')
+        if r.get('changedAt') is not None:
             parse_aware(r['changedAt'], f'{key}.reportTodo.changedAt')
     if t['category'] in CLOSED_CATEGORIES:
         check(bool(t.get('resolution')), f'{key} 标为 {t["category"]} 时必须写 resolution')

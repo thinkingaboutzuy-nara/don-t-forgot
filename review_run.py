@@ -86,20 +86,47 @@ def progress(state):
             'pageVerification': {k: state.get('pendingPage', {}).get(k) for k in ['attempts', 'confirmations']}}
 
 
-def start(runs, config, root, end=None, full=False):
+def completion_path(runs, session_id):
+    return runs / '.sessions' / (hashlib.sha256(session_id.encode()).hexdigest() + '.json')
+
+
+def bind_completion(runs, state, config, now, session_id=None):
+    session_id = session_id or os.environ.get('CODEX_THREAD_ID')
+    if not config.get('requireAutoCompletion') or not session_id:
+        return
+    target = completion_path(runs, session_id)
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    previous = read(target) if target.exists() else {}
+    continuing = previous.get('status') == 'running'
+    binding = {'sessionId': session_id, 'run': state['id'], 'status': 'running',
+               'requiredEnd': previous['requiredEnd'] if continuing else now.isoformat()}
+    if previous.get('run') == state['id'] and continuing:
+        binding.update({k: previous[k] for k in ['fingerprint', 'stalledStops'] if k in previous})
+    state['completionSessionId'] = session_id
+    save(target, binding)
+
+
+def start(runs, config, root, end=None, full=False, session_id=None, expected_complete_run=None):
     from update_inbox import open_view, parse_aware
+    need(not config.get('requireAutoCompletion') or session_id or os.environ.get('CODEX_THREAD_ID'),
+         '自动结束检查需要当前Codex会话身份CODEX_THREAD_ID；未绑定，不创建或接管整理')
     now = dt.datetime.now(ZoneInfo(config['timeZone'])).replace(microsecond=0)
     end = parse_aware(end, 'end').astimezone(ZoneInfo(config['timeZone'])) if end else now
     need(end <= now, '扫描终点不能在未来')
     identity = digest({'profile': config['profile'], 'root': str(root.resolve()), 'zone': config['timeZone']})
     with locked(runs):
         active = runs / '.active.json'
+        if expected_complete_run is not None:
+            need(active.exists() and read(active)['run'] == expected_complete_run
+                 and load_run(runs, expected_complete_run)[1]['phase'] == 'complete',
+                 '整理接续期间已有其他轮次接手，停止覆盖')
         if active.exists():
             path, state = load_run(runs, read(active)['run'])
             if state['phase'] != 'complete':
                 need(state['identity'] == identity, '未完成整理的账号或数据目录不同，不能接错任务')
                 state['attempts'] += 1
                 state['lastStartedAt'] = stamp()
+                bind_completion(runs, state, config, now, session_id)
                 save(path / 'review.json', state)
                 return progress(state)
         view = open_view(root)
@@ -129,6 +156,7 @@ def start(runs, config, root, end=None, full=False):
                  'attempts': 1, 'lastProgressAt': stamp(), 'createdAt': stamp(),
                  'verifyMessagePages': config.get('verifyMessagePages', False)}
         save(path / 'open-at-start.json', view)
+        bind_completion(runs, state, config, now, session_id)
         save(path / 'review.json', state)
         save(active, {'run': key})
         return progress(state)
@@ -425,13 +453,36 @@ def validate_ready(runs, key, sync, old_sync):
     return state
 
 
-def record_failure(runs, key, reason):
+def work_fingerprint(state):
+    return digest({k: state.get(k) for k in ['phase', 'cursor', 'pages', 'chunks', 'candidateHash']} | {
+        'reviewed': sorted(state['reviewed']), 'checks': sorted(state['checks'])})
+
+
+def record_failure(runs, key, reason, evidence=None, expected_session=None, expected_fingerprint=None):
     from update_inbox import merge
     need(10 <= len(reason) <= 1000, '失败说明须写清实际错误及下一动作')
     with locked(runs):
         path, state = load_run(runs, key)
         need(state['phase'] != 'complete', '已成功轮次不能重新标记失败')
+        if expected_session is not None:
+            need(state.get('completionSessionId') == expected_session
+                 and work_fingerprint(state) == expected_fingerprint,
+                 '整理已有新进度或已由其他会话接手，不写旧的停止结果')
+        blocker = None
+        if evidence is not None:
+            need(not state.get('completionSessionId') or expected_session == state['completionSessionId'],
+                 '故障证据必须来自当前绑定会话，不能替新接手会话登记旧错误')
+            evidence = pathlib.Path(evidence).resolve()
+            need(evidence.is_relative_to(path.resolve()) and evidence.stat().st_size <= 32768,
+                 '故障证据须为本轮目录内不超过32KiB的去敏JSON')
+            error = read(evidence)
+            need(isinstance(error, dict) and error.get('kind') in ['authentication', 'source', 'environment', 'identity', 'permission'], '无效故障类型')
+            need(error.get('status') == 'error' and all(isinstance(error.get(k), str) and 3 <= len(error[k]) <= 1000
+                 for k in ['operation', 'error']), '故障证据须包含实际失败操作与错误，未完成进度不是故障')
+            blocker = {'file': str(evidence.relative_to(path.resolve())), 'sha': digest(error),
+                       'fingerprint': work_fingerprint(state), 'sessionId': state.get('completionSessionId')}
         state['lastError'] = {'at': stamp(), 'reason': reason, 'phase': state['phase']}
+        state['stopBlocker'] = blocker
         save(path / 'review.json', state)
         sync = {'state': 'partial', 'mode': state['mode'],
                 'scope': f"{state['start']} 至 {state['end']}；已保存{len(state['pages'])}页，已审阅{len(state['reviewed'])}/{len(state['chunks'])}段；进度保留。",
@@ -521,7 +572,9 @@ def main():
         if cmd == 'check':
             p.add_argument('--key', required=True); p.add_argument('--note', required=True); p.add_argument('--skipped', action='store_true')
         if cmd == 'finish': p.add_argument('--message')
-        if cmd == 'fail': p.add_argument('--reason', required=True)
+        if cmd == 'fail':
+            p.add_argument('--reason', required=True)
+            p.add_argument('--evidence', type=pathlib.Path)
     args = parser.parse_args(); runs = args.project / 'work/runs'
     try:
         if args.cmd == 'start':
@@ -534,7 +587,12 @@ def main():
         elif args.cmd == 'ack': value = acknowledge(runs, args.run, read(args.input))
         elif args.cmd == 'check': value = check_stage(runs, args.run, args.key, args.note, args.skipped)
         elif args.cmd == 'stage': value = stage_candidate(runs, args.run, read(args.input), read(args.project / 'config.json'))
-        elif args.cmd == 'fail': value = record_failure(runs, args.run, args.reason)
+        elif args.cmd == 'fail':
+            state = load_run(runs, args.run)[1]
+            caller = os.environ.get('CODEX_THREAD_ID') if state.get('completionSessionId') else None
+            need(not state.get('completionSessionId') or caller, '未取得当前会话身份，不能登记绑定轮次的故障')
+            value = record_failure(runs, args.run, args.reason, args.evidence,
+                                   expected_session=caller, expected_fingerprint=work_fingerprint(state))
         else:
             payload = read(args.input or run_path(runs, args.run) / 'delta.json')
             value = finish(runs, args.run, payload, args.message or payload.get('sync', {}).get('message', '本轮整理已完成'))

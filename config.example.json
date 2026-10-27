@@ -12,5 +12,6 @@
   "profile": "<dws profile list 返回的 corpId:userId>",
   "selfOpenDingTalkId": "<本人 openDingTalkId>",
   "requireReviewReceipt": true,
-  "verifyMessagePages": true
+  "verifyMessagePages": true,
+  "requireAutoCompletion": false
 }

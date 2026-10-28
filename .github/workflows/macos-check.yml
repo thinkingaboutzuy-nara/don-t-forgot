@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   check:
@@ -38,9 +38,26 @@ jobs:
           python3 tests/ui_fixture.py "$RUNNER_TEMP/menu-data"
           python3 tests/ui_snapshot.py --data "$RUNNER_TEMP/menu-data" --out shots --steps \
             "snap,10-main;menudump,200,330;menu,改期限/自定义…;wait,0.8;snap,11-due-custom;menudump,322,160;menu,稍后提醒/自定义时间…;wait,0.8;snap,12-snooze-custom;menudump,200,500;menu,改期限/明天 18:00;wait,0.8;snap,13-due-tomorrow"
+      - name: Record and card screenshots
+        run: |
+          python3 tests/ui_fixture.py "$RUNNER_TEMP/record-data"
+          python3 tests/ui_snapshot.py --data "$RUNNER_TEMP/record-data" --out shots --steps \
+            "snap,20-main;click,290,596;wait,0.8;snap,21-record;click,200,40;wait,0.5;key,cmd=;wait,0.6;snap,22-full"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: screenshots
           path: shots/
           if-no-files-found: warn
+      # TEMPORARY: lets the cloud review session read the screenshots via git; remove before merge.
+      - name: Publish screenshots to a temporary branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          git checkout -q --orphan tmp-shots
+          git rm -rfq .
+          cp shots/*.png .
+          git add -- *.png
+          git commit -qm "合成数据截图（临时）"
+          git push -fq origin HEAD:refs/heads/tmp-shots/${{ github.head_ref }}

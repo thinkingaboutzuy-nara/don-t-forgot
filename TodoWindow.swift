@@ -135,6 +135,15 @@ struct WorkGroup: Identifiable {
     var title: String
     var tasks: [Todo]
     var collapsible = false
+    /// Shown next to a collapsed group's count.
+    var hint: String?
+}
+struct RunRecord {
+    var when: Date?
+    var added: [Todo]
+    var updated: [Todo]
+    var closed: [Todo]
+    var isEmpty: Bool { added.isEmpty && updated.isEmpty && closed.isEmpty }
 }
 struct UndoInfo {
     var token = UUID()
@@ -435,10 +444,11 @@ func isoLocalText(_ date: Date) -> String { isoLocal.string(from: date) }
             else if urgentAction { today.append(todo) }
             else { week.append(todo) }
         }
+        // Only 今天优先 is always open; the rest start folded so the window reads as today's list.
         return [WorkGroup(id: "today", title: "今天优先", tasks: today),
-                WorkGroup(id: "week", title: "本周处理", tasks: week),
-                WorkGroup(id: "waiting", title: "等别人回复", tasks: waiting),
-                WorkGroup(id: "confirm", title: "待确认", tasks: confirm, collapsible: true)].filter { !$0.tasks.isEmpty }
+                WorkGroup(id: "week", title: "本周处理", tasks: week, collapsible: true, hint: "不急今天"),
+                WorkGroup(id: "waiting", title: "等别人回复", tasks: waiting, collapsible: true, hint: "球在对方那里"),
+                WorkGroup(id: "confirm", title: "待确认", tasks: confirm, collapsible: true, hint: "线索不确定，有空再看")].filter { !$0.tasks.isEmpty }
     }
     var mineCount: Int { workGroups().filter { ["today", "week"].contains($0.id) }.reduce(0) { $0 + $1.tasks.count } }
     var summaryText: String {
@@ -509,6 +519,23 @@ func isoLocalText(_ date: Date) -> String { isoLocal.string(from: date) }
     func markSeen(at date: Date = Date()) {
         guard newCount > 0 else { return }
         seenThrough = date; persistSeen?(date); onChange?()
+    }
+    /// 整理 appends each new update as its own line, newest last. Cards lead with the newest one.
+    func detailParts(_ todo: Todo) -> (latest: String, earlier: [String]) {
+        let parts = todo.detail.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard let last = parts.last else { return ("", []) }
+        return (last, Array(parts.dropLast()))
+    }
+    /// What the latest write to inbox.json touched: merges stamp firstSeen, lastSeen and closedAt with the same time as updatedAt.
+    var lastRun: RunRecord {
+        guard let stamp = inbox.updatedAt else { return RunRecord(when: nil, added: [], updated: [], closed: []) }
+        var record = RunRecord(when: parseDate(stamp), added: [], updated: [], closed: [])
+        for t in inbox.tasks where t.lastSeen == stamp {
+            if t.firstSeen == stamp { record.added.append(t) }
+            else if t.closedAt == stamp { record.closed.append(t) }
+            else { record.updated.append(t) }
+        }
+        return record
     }
     func isHandedOff(_ todo: Todo) -> Bool { todo.dispatch?.threadId != nil || actions[todo.id]?.handoffAt != nil }
     /// Why an archived card is archived. Shown on the card so a past tick can always be explained.
@@ -622,9 +649,10 @@ func isoLocalText(_ date: Date) -> String { isoLocal.string(from: date) }
                 ("明天 09:00", tomorrow.addingTimeInterval(9 * 3600)),
                 ("下周一 09:00", monday)]
     }
-    func clipboardText(_ todo: Todo) -> String {
-        let sources = todo.sources.map { "\($0.directionText)\n会话：\($0.chat) · \($0.time)\n\($0.quote)" }.joined(separator: "\n\n")
-        return "\(todo.title)\n\(todo.detail)\n\n\(sources)"
+    /// The original DingTalk messages, oldest first, ready to paste back into a chat.
+    func sourcesText(_ todo: Todo) -> String {
+        todo.sources.sorted { (parseDate($0.time) ?? .distantPast) < (parseDate($1.time) ?? .distantPast) }
+            .map { "\($0.senderName ?? $0.chat) · \($0.chat) · \($0.time)\n\($0.quote)" }.joined(separator: "\n\n")
     }
     func handoffPrompt(_ todo: Todo) -> String {
         var lines = ["请接手「别忘了」里的这件事（事项 ID：\(todo.id)）。", "", "事项：\(todo.title)"]
@@ -701,42 +729,6 @@ func isoLocalText(_ date: Date) -> String { isoLocal.string(from: date) }
                           title: "\(nudgeTarget(t)) 的回复已等 \(waitingDays(t) ?? 3) 天", body: t.displayTitle, category: nil)
         }
     }
-
-    // MARK: Daily report
-    /// Everything that became done today, by the user or by整理, newest first.
-    var completedToday: [Todo] {
-        items(2).filter { status($0) == "done" && closedDate($0).map { appCalendar.isDate($0, inSameDayAs: now) } == true }
-    }
-    func reportPrompt() -> String {
-        let day = dateText(now, format: "yyyy-MM-dd")
-        var lines = ["请用 work-reports MCP 整理我 \(dateText(now, format: "M月d日"))（\(day)）的日报。", ""]
-        let done = completedToday
-        if done.isEmpty {
-            lines.append("今天在「别忘了」还没有标记完成的事。请先读取今天日报的现状，再问我今天做了什么。")
-        } else {
-            lines.append("今天在「别忘了」完成的事：")
-            for (i, t) in done.enumerated() {
-                let a = actions[t.id]
-                var line = "\(i + 1). \(t.displayTitle)（事项 ID：\(t.id)）"
-                if let r = t.reportTodo { line += "［日报待办 \(r.id)，平台\(r.done ? "已" : "未")勾选，version \(r.version)］" }
-                if let a, a.status == "done" {
-                    line += " — 我选的理由：\(a.reason ?? "未记录")"
-                    if let note = a.note { line += "；备注：\(note)" }
-                } else if let r = t.resolution {
-                    line += " — 整理时确认完成：\(r.prefix(160))"
-                }
-                lines.append(line)
-            }
-        }
-        lines += ["", "要求：",
-                  "- 先 get_reporting_context，再用 search_reports 查今天是否已有日报；已有就在原报告上用 save_report_draft 按新事项 ID 追加，不改动已有事项。",
-                  "- 默认只写理由为“办完了”或整理确认完成、且是我本人做的工作；“对方已处理”“不用做了”的先列出来问我要不要写。",
-                  "- 工时不要猜，留空让我填；项目只在 search_projects 能唯一对应时才带上，否则留空并告诉我。",
-                  "- 先保存草稿，把事项和缺项给我看。我明确说“提交”后再 submit_report，并把平台确认链接给我。",
-                  "- 标了［日报待办］且平台未勾选的，用 set_todo_done 同步勾选（先 get_todos 取当前 version）。"]
-        return lines.joined(separator: "\n")
-    }
-    var reportURL: URL? { codexNewThreadURL(reportPrompt()) }
 
     // MARK: Schedule
     func lastExpectedRun(before date: Date) -> Date? {
@@ -847,6 +839,7 @@ struct TodoRow: View {
     @State private var flash = false
     @State private var pickedDue = Date()
     @State private var copiedNudge = false
+    @State private var showEarlier = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var status: String { store.status(todo) }
     var archived: Bool { store.isArchived(todo) }
@@ -890,9 +883,7 @@ struct TodoRow: View {
                 timePanel
             }
             if shown != .compact {
-                Text(todo.detail).font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3)
-                    .lineLimit(shown == .standard || (archived && !expanded) ? 2 : nil)
-                    .fixedSize(horizontal: false, vertical: true).padding(.leading, 38)
+                detailBlock
                 if let c = store.closure(todo) { closureBox(c) }
             }
             if status == "snoozed", let until = store.actions[todo.id]?.until {
@@ -979,9 +970,17 @@ struct TodoRow: View {
         .help("更多操作（也可以在卡片上按右键）").accessibilityLabel("更多操作：" + todo.displayTitle)
     }
 
-    /// Shared by “…” and the card's right-click menu. Groups: time, moving it forward, reference, then 忽略 alone at the bottom.
+    /// Shared by “…” and the card's right-click menu. DingTalk first, then time, then hand-off; 忽略 alone at the bottom.
     @ViewBuilder var menuItems: some View {
+        if archived || status == "snoozed" {
+            Button("恢复到待办") { withAnimation(.easeInOut(duration: 0.3)) { store.restore(todo) } }
+            Divider()
+        }
+        Button("打开钉钉") { openDingTalk() }
+        Button("复制原消息") { copyToPasteboard() }
+        if store.canNudge(todo) { Button("复制催办话") { copyNudge() } }
         if !archived {
+            Divider()
             if status != "snoozed" {
                 Menu("稍后提醒") {
                     ForEach(store.snoozeChoices, id: \.label) { choice in
@@ -1005,15 +1004,6 @@ struct TodoRow: View {
             Button(store.isHandedOff(todo) ? "再交给 Codex…" : "交给 Codex 处理…") {
                 openURL(store.handoffURL(todo)); store.markHandoff(todo)
             }
-            if store.canNudge(todo) { Button("复制催办话") { copyNudge() } }
-        }
-        if archived || status == "snoozed" {
-            Button("恢复到待办") { withAnimation(.easeInOut(duration: 0.3)) { store.restore(todo) } }
-        }
-        Divider()
-        Button("复制待办与来源") { copyToPasteboard() }
-        Button("打开钉钉") { openDingTalk() }
-        if !archived {
             Divider()
             Button("忽略这条…") { withAnimation(.snappy(duration: 0.25)) { mode = .dismissing; note = "" } }
         }
@@ -1109,6 +1099,40 @@ struct TodoRow: View {
         .padding(.leading, 38)
     }
 
+    /// Newest update only; earlier updates stay one click away so long-running items don't flood the list.
+    @ViewBuilder var detailBlock: some View {
+        let parts = store.detailParts(todo)
+        if !parts.latest.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(parts.latest).font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3)
+                    .lineLimit(shown == .full && !archived ? nil : 2)
+                    .fixedSize(horizontal: false, vertical: true)
+                if shown == .full && !parts.earlier.isEmpty {
+                    Button { withAnimation(.snappy(duration: 0.2)) { showEarlier.toggle() } } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: showEarlier ? "chevron.down" : "chevron.right").font(.system(size: 9, weight: .semibold))
+                            Text(showEarlier ? "收起更早经过" : "更早经过")
+                            Text("\(parts.earlier.count) 段").foregroundStyle(.tertiary)
+                        }.font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel((showEarlier ? "收起更早经过：" : "展开更早经过：") + todo.displayTitle)
+                    if showEarlier {
+                        VStack(alignment: .leading, spacing: 5) {
+                            ForEach(Array(parts.earlier.reversed().enumerated()), id: \.offset) { _, line in
+                                Text(line).font(.system(size: 11)).foregroundStyle(.tertiary).lineSpacing(2)
+                                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                            }
+                        }
+                        .padding(.leading, 10)
+                        .overlay(alignment: .leading) { Rectangle().fill(Color.primary.opacity(0.08)).frame(width: 2) }
+                        .transition(.opacity)
+                    }
+                }
+            }.padding(.leading, 38)
+        }
+    }
+
     var evidence: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button { withAnimation(.snappy(duration: 0.2)) { expanded.toggle() } } label: {
@@ -1135,7 +1159,7 @@ struct TodoRow: View {
                         }
                     }
                     HStack {
-                        Button("复制线索") { copyToPasteboard() }
+                        Button("复制原消息") { copyToPasteboard() }
                         Button("打开钉钉") { openDingTalk() }
                     }.font(.system(size: 11)).buttonStyle(.bordered)
                 }.padding(.top, 4)
@@ -1164,7 +1188,7 @@ struct TodoRow: View {
     }
     func copyToPasteboard() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(store.clipboardText(todo), forType: .string)
+        NSPasteboard.general.setString(store.sourcesText(todo), forType: .string)
     }
     func badge(_ text: String, _ color: Color, fill: Color? = nil) -> some View {
         Text(text).font(.system(size: 9, weight: .semibold)).foregroundStyle(color).lineLimit(1).fixedSize()
@@ -1196,21 +1220,30 @@ struct MainView: View {
     @ObservedObject var store: TodoStore
     @ObservedObject var settings: WindowSettings
     @State private var tab = 0
-    @State private var showSync = false
+    @State private var showInfo = false
+    @State private var showRecord = false
     @State private var query = ""
     @FocusState private var searchFocused: Bool
     @State private var hovering = false
-    // Per-tab card length: 待办 full, 稍后 standard, 已收起 compact unless the user changes it.
-    @AppStorage("cardLength.0") private var length0 = CardLength.full.rawValue
-    @AppStorage("cardLength.1") private var length1 = CardLength.standard.rawValue
-    @AppStorage("cardLength.2") private var length2 = CardLength.compact.rawValue
+    // Per-tab card length: 待办 and 稍后 standard, 已收起 compact unless the user changes it.
+    // New keys (v2) so the earlier “完整” default doesn't carry over.
+    @AppStorage("cardLength.v2.0") private var length0 = CardLength.standard.rawValue
+    @AppStorage("cardLength.v2.1") private var length1 = CardLength.standard.rawValue
+    @AppStorage("cardLength.v2.2") private var length2 = CardLength.compact.rawValue
     var length: CardLength { CardLength(rawValue: [length0, length1, length2][tab]) ?? .full }
     func setLength(_ value: CardLength) {
         withAnimation(.snappy(duration: 0.25)) {
             switch tab { case 0: length0 = value.rawValue; case 1: length1 = value.rawValue; default: length2 = value.rawValue }
         }
     }
-    @AppStorage("confirmGroupExpanded") private var confirmExpanded = false
+    /// Ids of folded groups the user opened, comma-separated. 今天优先 is never folded.
+    @AppStorage("openGroups") private var openGroups = ""
+    func isOpen(_ group: WorkGroup) -> Bool { !group.collapsible || openGroups.split(separator: ",").contains(Substring(group.id)) }
+    func setOpen(_ id: String, _ open: Bool) {
+        var ids = Set(openGroups.split(separator: ",").map(String.init))
+        if open { ids.insert(id) } else { ids.remove(id) }
+        openGroups = ids.sorted().joined(separator: ",")
+    }
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -1289,7 +1322,7 @@ struct MainView: View {
                     if tab == 0 {
                         ForEach(store.workGroups()) { group in
                             groupHeader(group)
-                            if !group.collapsible || confirmExpanded {
+                            if isOpen(group) {
                                 ForEach(group.tasks) { todo in row(todo) }
                             }
                         }
@@ -1321,7 +1354,7 @@ struct MainView: View {
         store.scrolledFocus = f.token
         let target = store.tab(for: todo)
         if target == 2 { query = "" }
-        if target == 0, store.workGroups().contains(where: { $0.collapsible && $0.tasks.contains { $0.id == todo.id } }) { confirmExpanded = true }
+        if target == 0, let group = store.workGroups().first(where: { $0.tasks.contains { $0.id == todo.id } }), !isOpen(group) { setOpen(group.id, true) }
         withAnimation(.snappy(duration: 0.2)) { tab = target }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
             withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(todo.id, anchor: .top) }
@@ -1329,20 +1362,21 @@ struct MainView: View {
     }
 
     @ViewBuilder func groupHeader(_ group: WorkGroup) -> some View {
+        let open = isOpen(group)
         let content = HStack(spacing: 6) {
             if group.collapsible {
-                Image(systemName: confirmExpanded ? "chevron.down" : "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                Image(systemName: open ? "chevron.down" : "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
             }
             Text(group.title).font(.system(size: 12, weight: .semibold))
             Text("\(group.tasks.count)").font(.system(size: 10)).foregroundStyle(.secondary).contentTransition(.numericText())
-            if group.collapsible && !confirmExpanded {
-                Text("线索不确定，有空再看").font(.system(size: 10)).foregroundStyle(.tertiary)
+            if !open, let hint = group.hint {
+                Text(hint).font(.system(size: 10)).foregroundStyle(.tertiary)
             }
             Spacer()
         }.padding(.horizontal, 4).padding(.top, 8).frame(minHeight: 24).contentShape(Rectangle())
         if group.collapsible {
-            Button { withAnimation(.snappy(duration: 0.25)) { confirmExpanded.toggle() } } label: { content }
-                .buttonStyle(.plain).accessibilityLabel(confirmExpanded ? "收起待确认" : "展开待确认")
+            Button { withAnimation(.snappy(duration: 0.25)) { setOpen(group.id, !open) } } label: { content }
+                .buttonStyle(.plain).accessibilityLabel((open ? "收起" : "展开") + group.title)
         } else { content }
     }
 
@@ -1386,26 +1420,27 @@ struct MainView: View {
                 Text(store.syncLine).font(.system(size: 9)).foregroundStyle(.secondary)
             }
             Spacer()
-            Button { openURL(store.reportURL) } label: {
+            Button { showRecord.toggle() } label: {
                 HStack(spacing: 4) {
-                    Image(systemName: "doc.text")
-                    Text(store.completedToday.isEmpty ? "整理日报" : "整理日报 · \(store.completedToday.count)").contentTransition(.numericText())
+                    Image(systemName: "clock.arrow.circlepath")
+                    Text("整理记录")
                 }.font(.system(size: 11, weight: .medium)).foregroundStyle(accent)
                     .padding(.horizontal, 8).padding(.vertical, 5).background(accent.opacity(0.10), in: Capsule())
             }
-            .buttonStyle(.plain).help("把今天完成的事带进新的 Codex 对话，整理成日报草稿")
-            .accessibilityLabel("整理今天日报，今天完成 \(store.completedToday.count) 件")
-            Button { showSync.toggle() } label: {
+            .buttonStyle(.plain).help("上次整理读到哪里、改了哪些事项")
+            .accessibilityLabel("整理记录")
+            .popover(isPresented: $showRecord, arrowEdge: .top) { recordPanel }
+            Button { showInfo.toggle() } label: {
                 Image(systemName: "info.circle").font(.system(size: 14))
                     .overlay(alignment: .topTrailing) {
                         if hasNews { Circle().fill(warm).frame(width: 6, height: 6).offset(x: 2, y: -1) }
                     }
             }
                 .buttonStyle(.plain).foregroundStyle(.secondary)
-                .help(hasNews ? "有新版本，点开看更新日志" : "上次整理、通知设置和更新日志")
-                .accessibilityLabel(hasNews ? "上次整理详情，有新的更新日志" : "上次整理详情")
-                .popover(isPresented: $showSync, arrowEdge: .top) { syncDetail }
-                .onChange(of: showSync) { if showSync, let latest = changelog.first { changelogSeen = latest.title } }
+                .help(hasNews ? "有新版本，点开看更新日志" : "通知设置和更新日志")
+                .accessibilityLabel(hasNews ? "设置，有新的更新日志" : "设置与更新日志")
+                .popover(isPresented: $showInfo, arrowEdge: .top) { infoPanel }
+                .onChange(of: showInfo) { if showInfo, let latest = changelog.first { changelogSeen = latest.title } }
         }.padding(.horizontal, 17).padding(.vertical, 12)
     }
 
@@ -1414,17 +1449,59 @@ struct MainView: View {
     @State private var showAllChangelog = false
     var hasNews: Bool { changelog.first.map { $0.title != changelogSeen } ?? false }
 
-    var syncDetail: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("上次整理").font(.system(size: 12, weight: .semibold))
-            if let message = store.inbox.sync?.message, !message.isEmpty { Text(message).font(.system(size: 11)) }
-            if let scope = store.inbox.sync?.scope { Text(scope).font(.system(size: 10)).foregroundStyle(.secondary) }
-            if let mode = store.inbox.sync?.mode { Text(mode == "full" ? "本次为完整回扫" : "本次为增量整理").font(.system(size: 10)).foregroundStyle(.secondary) }
+    /// Last write to the list: when, how far it read, and which items it added, updated or closed (click to jump).
+    var recordPanel: some View {
+        let record = store.lastRun
+        let sync = store.inbox.sync
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("整理记录").font(.system(size: 12, weight: .semibold))
+            if let when = record.when {
+                Text("\(store.dayLabel(when)) \(dateText(when, format: "HH:mm")) 写入" + (sync?.mode == "full" ? " · 完整回扫" : sync?.mode == "incremental" ? " · 增量整理" : ""))
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Text(store.syncLine).font(.system(size: 10)).foregroundStyle(.secondary)
+            if sync?.state == "error" || sync?.state == "partial" {
+                Label(sync?.message ?? "这次读取不完整，已保留旧待办。", systemImage: "exclamationmark.circle")
+                    .font(.system(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            } else if let message = sync?.message, !message.isEmpty {
+                Text(message).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+            }
+            Divider().padding(.vertical, 2)
+            if record.isEmpty {
+                Text("这次没有新增、更新或收起的事项。").font(.system(size: 11)).foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        recordGroup("新增", record.added)
+                        recordGroup("有更新", record.updated)
+                        recordGroup("整理时收起", record.closed)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(maxHeight: 300)
+            }
             HStack {
-                if store.runURL != nil { Button("打开整理记录") { openURL(store.runURL) } }
+                if store.runURL != nil { Button("打开整理对话") { openURL(store.runURL) } }
                 if let dir = appConfig.projectDirectory { Button("打开项目目录") { openURL(URL(fileURLWithPath: dir)) } }
             }.font(.system(size: 11)).buttonStyle(.bordered)
-            Divider().padding(.vertical, 2)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(14).frame(width: 300, alignment: .leading)
+    }
+    @ViewBuilder func recordGroup(_ title: String, _ tasks: [Todo]) -> some View {
+        if !tasks.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("\(title) \(tasks.count)").font(.system(size: 11, weight: .semibold)).foregroundStyle(accent)
+                ForEach(tasks) { t in
+                    Button { showRecord = false; store.requestFocus(t.id) } label: {
+                        Text("· " + t.displayTitle).font(.system(size: 11)).foregroundStyle(.primary).lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                    }.buttonStyle(.plain).help("在浮窗里定位这件事")
+                }
+            }
+        }
+    }
+
+    var infoPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Text("系统通知").font(.system(size: 12, weight: .semibold))
             ForEach(NotifyKind.allCases) { kind in
                 Toggle(kind.label, isOn: Binding(get: { !store.muted.contains(kind) }, set: { store.setMuted(kind, !$0) }))

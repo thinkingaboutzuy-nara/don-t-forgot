@@ -60,7 +60,7 @@ CHECKS = r'''
         expect(groups["week"] == ["later"], "week group")
         expect(groups["waiting"] == ["waiting-urgent"], "waiting stays separate")
         expect(groups["confirm"] == ["confirm-waiting", "confirm-plain"], "confirm group")
-        expect(store.workGroups().last?.collapsible == true, "confirm group collapsible")
+        expect(store.workGroups().map(\.collapsible) == [false, true, true, true], "only 今天优先 stays open")
         expect(store.mineCount == 5, "menu bar counts own actions only")
         expect(task("x", "action", title: "待确认：备用金方案").displayTitle == "备用金方案", "display title strips prefix")
         // Waiting days from local source time
@@ -119,16 +119,26 @@ CHECKS = r'''
         store.actions = ["r": LocalAction(status: "active", until: nil, updatedAt: "2026-10-21T08:30:00Z")]
         expect(store.status(linked) == "active", "manual restore newer than platform tick wins")
         expect(Source(chat: "工作汇报", time: "2026-10-19", quote: "q", messageId: "todo:t1", conversationId: "report:x", conversationType: "report").directionText == "日报待办", "report source label")
-        // Daily report hand-off lists today's completions with reasons
-        store.inbox.tasks = [task("a", "action", title: "交付周报"), task("b", "action", title: "核对编码"), task("c", "action", title: "昨天的事")]
-        store.actions = ["a": LocalAction(status: "done", until: nil, updatedAt: "2026-10-21T08:10:00Z", reason: "办完了", note: "已发群里"),
-                         "b": LocalAction(status: "done", until: nil, updatedAt: "2026-10-21T08:20:00Z", reason: "对方已处理"),
-                         "c": LocalAction(status: "done", until: nil, updatedAt: "2026-10-20T08:00:00Z", reason: "办完了")]
-        expect(store.completedToday.map(\.id) == ["b", "a"], "completed today, newest first \(store.completedToday.map(\.id))")
-        let report = store.reportPrompt()
-        expect(report.contains("2026-10-21") && report.contains("交付周报") && report.contains("备注：已发群里") && !report.contains("昨天的事"), "report prompt content")
-        expect(report.contains("submit_report") && report.contains("工时不要猜"), "report prompt boundaries")
-        expect(store.reportURL?.absoluteString.hasPrefix("codex://threads/new?prompt=") == true, "report link")
+        // Cards lead with the newest update; the run record lists what the last write touched
+        var long = task("l1", "action")
+        long.detail = "10月23日承诺优化脚本。\n\n27日10:56 二维码链接被拒绝，承诺重新取链。\n  10月27日17:39 544 笔已核对，剩余仍需结果。  "
+        let parts = store.detailParts(long)
+        expect(parts.latest == "10月27日17:39 544 笔已核对，剩余仍需结果。" && parts.earlier.count == 2 && parts.earlier[0] == "10月23日承诺优化脚本。", "newest update first \(parts)")
+        expect(store.detailParts(task("e", "action")).latest.isEmpty, "empty detail")
+        let stamp = "2026-10-21T01:05:00.123456+00:00"
+        var added = task("ra", "action"); added.firstSeen = stamp; added.lastSeen = stamp
+        var touched = task("ru", "action"); touched.firstSeen = "2026-10-19T01:00:00+00:00"; touched.lastSeen = stamp
+        var closedNow = task("rc", "resolved", resolution: "已上线"); closedNow.lastSeen = stamp; closedNow.closedAt = stamp
+        let untouched = task("rx", "action")
+        store.inbox.tasks = [added, touched, closedNow, untouched]
+        store.inbox.updatedAt = stamp
+        let record = store.lastRun
+        expect(record.added.map(\.id) == ["ra"] && record.updated.map(\.id) == ["ru"] && record.closed.map(\.id) == ["rc"] && record.when == parseDate(stamp), "run record")
+        store.inbox.updatedAt = "2026-10-21T02:00:00+00:00"
+        expect(store.lastRun.isEmpty, "a later sync-only write lists nothing")
+        let msgs = task("m", "action", sources: [Source(chat: "采购群", time: "2026-10-20 10:00", quote: "第二条", messageId: "2", conversationId: "c", senderName: "叶龙"),
+                                                   Source(chat: "采购群", time: "2026-10-19 09:00", quote: "第一条", messageId: "1", conversationId: "c")])
+        expect(store.sourcesText(msgs) == "采购群 · 采购群 · 2026-10-19 09:00\n第一条\n\n叶龙 · 采购群 · 2026-10-20 10:00\n第二条", "copied messages oldest first \(store.sourcesText(msgs))")
         // Archive search and day sections
         store.now = parseDate("2026-10-22T18:00:00+08:00")!
         var withQuote = task("q1", "action", title: "核对成都编码", sources: [Source(chat: "设备采购群", time: "2026-10-20 10:00", quote: "请把 20 台编码发我", messageId: "m", conversationId: "c", senderName: "叶龙")])
@@ -282,7 +292,7 @@ CHECKS = r'''
         expect(log.map(\.title) == ["2026-10-23", "2026-10-21"] && log[0].items == ["稍后到点会弹窗并可再推 1 小时", "可以自己改期限"] && log[1].items == ["首版"], "changelog parse \(log)")
         expect(parseChangelog("").isEmpty && parseChangelog("没有标题\n- 孤立条目").isEmpty, "no changelog is fine")
         if failed > 0 { exit(1) }
-        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link and daily report, archive search, new badge, own deadline, snooze/due notices, morning summary, nudge, focus, changelog")
+        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link, newest update, run record, copied messages, archive search, new badge, own deadline, snooze/due notices, morning summary, nudge, focus, changelog")
     }
 }
 '''

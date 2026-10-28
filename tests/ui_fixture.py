@@ -3,7 +3,8 @@
 
 python3 tests/ui_fixture.py <empty dir>
 
-Covers: 今天优先 with an own deadline (“已改”), 本周, 等回复 past 3 days (“催一下”), 待确认, a snoozed card, an archived card.
+Covers: 今天优先 with an own deadline (“已改”) and several updates, 本周, 等回复 past 3 days (“催一下”), 待确认, a snoozed card,
+an archived card, and a run record (one added, one closed by the run).
 """
 import datetime as dt
 import json
@@ -29,13 +30,14 @@ def main(out):
     waiting['sources'][0].update(time=local(-4), senderName='我', senderId='self', recipientName='演示同事', quote='到货了麻烦确认一下，谢谢')
     tasks = [
         task('demo-urgent', '提交演示报销单', priority=0, due=day(0)),
-        task('demo-moved', '整理演示周报', due=day(3), detail='整理给的期限是三天后，这里改成了今天。'),
+        task('demo-moved', '整理演示周报', due=day(3), detail='10月23日承诺先整理一版演示周报。\n'
+             '25日同事补充了两项数据，口径仍待确认。\n整理给的期限是三天后，这里改成了今天；数据口径已确认，只差汇总。'),
         task('demo-week', '核对演示清单', due=day(4), firstSeen=now.isoformat()),
         waiting,
         task('demo-wait-new', '等演示同事回复报价', 'waiting', waitingSince=day(-1, 10)),
         task('demo-confirm', '待确认：演示线索', needsConfirm=True),
         task('demo-snoozed', '回电演示客户'),
-        task('demo-done', '已发布的演示版本', 'resolved', resolution='合成数据：已完成'),
+        task('demo-done', '已发布的演示版本', 'resolved', resolution='合成数据：已完成', closedAt=now.isoformat()),
     ]
     actions = {
         'demo-moved': {'updatedAt': now.isoformat(), 'dueOverride': (now + dt.timedelta(hours=2)).isoformat()},

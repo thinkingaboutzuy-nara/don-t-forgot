@@ -135,20 +135,23 @@ def verify(script):
         assert 'closedAt' not in row and not inbox['archived']
         assert (root / 'actions.json').read_bytes() == json.dumps(actions).encode()
 
-    # Report platform link: pending ticks, platform-newer wins, validation
+    # DingTalk only: no daily-report sync list; items that came only from the report platform are left out of runs
     with tempfile.TemporaryDirectory(prefix='todo-merge-report-') as tmp:
         root = pathlib.Path(tmp)
         linked = copy.deepcopy(task)
-        linked.update(id='report-todo-t1', title='日报待办：核对验收', reportTodo={'id': 't1', 'version': 2, 'done': False})
-        module.merge(root, {'tasks': [linked]})
+        linked.update(id='report-todo-t1', title='钉钉里也提过的事', reportTodo={'id': 't1', 'version': 2, 'done': False})
+        platform = copy.deepcopy(task)
+        platform.update(id='report-only', title='日报待办：只在日报里', sources=[{'chat': '工作汇报', 'time': '2026-10-19', 'quote': '下一步',
+                        'messageId': 'todo:t2', 'conversationId': 'report:x', 'conversationType': 'report'}])
+        module.merge(root, {'tasks': [linked, platform]})
         (root / 'actions.json').write_text(json.dumps({'report-todo-t1': {'status': 'done', 'reason': '办完了', 'updatedAt': '2026-10-21T08:00:00Z'}}))
-        sync = module.open_view(root)['reportSync']
-        assert sync == [{'id': 'report-todo-t1', 'todoId': 't1', 'expectedVersion': 2, 'done': True, 'at': '2026-10-21T08:00:00Z'}], sync
-        # The platform was unticked later on the web: no push, and the task is open again.
+        view = module.open_view(root)
+        assert 'reportSync' not in view and view['open'] == [], view
+        # Existing links keep the old precedence: a later platform change still reopens a DingTalk item.
         linked['reportTodo'] = {'id': 't1', 'version': 3, 'done': False, 'changedAt': '2026-10-21T09:00:00Z'}
         module.merge(root, {'tasks': [linked]})
-        view = module.open_view(root)
-        assert view['reportSync'] == [] and [t['id'] for t in view['open']] == ['report-todo-t1'], view
+        assert [t['id'] for t in module.open_view(root)['open']] == ['report-todo-t1']
+        assert module.report_only(platform) and not module.report_only(linked)
         bad = copy.deepcopy(linked)
         bad['reportTodo'] = {'id': 't1', 'version': '3', 'done': False}
         rejected(module, root, {'tasks': [bad]}, 'reportTodo version 类型')
@@ -162,7 +165,7 @@ def verify(script):
         run = subprocess.run([sys.executable, '-O', str(script), '--data-dir', tmp, '--input', str(delta)],
                              capture_output=True, text=True)
         assert run.returncode != 0 and '增量被拒绝' in run.stderr, run
-    print('PASS: stable ID, manual actions, failed coverage, atomic rejection, stale, open view with own deadline, archive, report sync, python -O')
+    print('PASS: stable ID, manual actions, failed coverage, atomic rejection, stale, open view with own deadline, archive, DingTalk-only open view, python -O')
 
 
 if __name__ == '__main__':

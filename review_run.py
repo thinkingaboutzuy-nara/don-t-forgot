@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 
 HERE = pathlib.Path(__file__).resolve().parent
 CHUNK_CHARS = 6000
-STAGES = ['formal_todos', 'codex', 'report', 'handoffs']
+STAGES = ['formal_todos', 'codex', 'handoffs']   # DingTalk only; the daily-report platform is no longer read
 
 
 class ReviewError(ValueError):
@@ -125,6 +125,10 @@ def start(runs, config, root, end=None, full=False, session_id=None, expected_co
             path, state = load_run(runs, read(active)['run'])
             if state['phase'] != 'complete':
                 need(state['identity'] == identity, '未完成整理的账号或数据目录不同，不能接错任务')
+                # Runs started before 2026-11-02 still list the retired daily-report check.
+                if 'report' in state['requiredChecks']:
+                    state['requiredChecks'] = [k for k in state['requiredChecks'] if k != 'report']
+                    state['checks'].pop('report', None)
                 # Redaction rules may have improved since this run cached its messages.
                 if remask(path, state, group_filter(config, read(path / 'open-at-start.json'))):
                     state['remaskedAt'] = stamp()
@@ -214,14 +218,132 @@ def safe_text(text):
     return text
 
 
+# Login material often arrives without any label: an account in one message and a short password in the next.
+# Neither looks secret on its own, so these checks look at neighbouring messages. A lone e-mail address or a
+# lone "iPhone15" stays readable; only a pair (or a token right after a login cue) is hidden.
+LOGIN_MASK = '[疑似登录材料已隐藏，按消息ID核对]'
+ACCOUNT = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|(?<!\d)1[3-9]\d{9}(?!\d)')
+LOGIN_CUE = re.compile(r'账号|帐号|账户|用户名|登录|登陆|login|user ?name|\bpwd\b|passwd', re.I)
+TOKEN = re.compile(r'(?<![\x21-\x7e])[\x21-\x7e]{6,32}(?![\x21-\x7e])')
+PAIR_WINDOW = dt.timedelta(minutes=10)
+
+
+def account_like(text):
+    return bool(ACCOUNT.fullmatch(text.strip()))
+
+
+def password_like(text):
+    """A short single token mixing letters and digits (or three character classes): a possible password."""
+    t = text.strip()
+    if not 6 <= len(t) <= 32 or not re.fullmatch(r'[\x21-\x7e]+', t) or '[' in t or ']' in t:
+        return False
+    if ACCOUNT.fullmatch(t) or FILE_NAME.search(t) or re.fullmatch(r'v?\d+(?:\.\d+)+', t, re.I):
+        return False
+    classes = sum(bool(re.search(c, t)) for c in [r'[a-z]', r'[A-Z]', r'\d', r'[^A-Za-z0-9]'])
+    return bool(re.search(r'[A-Za-z]', t) and re.search(r'\d', t)) or classes >= 3
+
+
+def login_cue(text):
+    """A login word outside our own [...] placeholders (which themselves say 登录)."""
+    return bool(LOGIN_CUE.search(re.sub(r'\[[^\]]*\]', '', text)))
+
+
+def inline_login(text):
+    """One message holding both an account and a password-like token, or a login cue and such a token."""
+    accounts = [m.group(0) for m in ACCOUNT.finditer(text)]
+    tokens = [t for t in TOKEN.findall(text) if password_like(t) and not ACCOUNT.search(t)]
+    if tokens and (accounts or login_cue(text)):
+        return accounts + tokens
+    return []
+
+
+def mask_inline(text):
+    for value in sorted(set(inline_login(text)), key=len, reverse=True):
+        text = re.sub(r'(?<![\x21-\x7e])' + re.escape(value) + r'(?![\x21-\x7e])', LOGIN_MASK, text)
+    return text
+
+
+def message_time(m):
+    try:
+        return dt.datetime.fromisoformat(m.get('createTime', ''))
+    except ValueError:
+        return None
+
+
+def login_pairs(messages, same_sender=True):
+    """Indexes of messages that together look like login material: a password-like message next to an account
+    from the same sender within 10 minutes, or right after a login cue. `messages` are in time order."""
+    hits = set()
+    for i, m in enumerate(messages):
+        if not password_like(m.get('content', '')):
+            continue
+        near = []
+        for j in range(max(0, i - 3), min(len(messages), i + 4)):
+            other = messages[j]
+            if j == i or (same_sender and other.get('senderOpenDingTalkId') != m.get('senderOpenDingTalkId')):
+                continue
+            a, b = message_time(m), message_time(other)
+            if same_sender and a and b and abs(a - b) > PAIR_WINDOW:
+                continue
+            near.append(j)
+        accounts = [j for j in near if account_like(messages[j].get('content', ''))]
+        cue = [j for j in near if j < i and login_cue(messages[j].get('content', ''))]
+        if accounts or cue:
+            hits.update([i, *accounts])
+    return hits
+
+
+def mask_message(m):
+    """Mask login material inside one normalized message, including its quoted and forwarded parts."""
+    m['content'] = mask_inline(m.get('content', ''))
+    parts = ([m['quotedMessage']] if m.get('quotedMessage') else []) + list(m.get('forwardMessages', []))
+    if parts:
+        bundle = sorted(parts, key=lambda x: x.get('createTime', '')) + [m]
+        for i in login_pairs(bundle, same_sender=False):
+            bundle[i]['content'] = LOGIN_MASK
+    return m
+
+
+def mask_sequence(messages):
+    """Mask login pairs across top-level messages, per conversation in time order. Returns True if any changed."""
+    changed = False
+    by_chat = collections.defaultdict(list)
+    for m in messages:
+        by_chat[m.get('openConversationId')].append(m)
+    for items in by_chat.values():
+        items.sort(key=lambda x: (x.get('createTime', ''), x.get('openMessageId', '')))
+        for i in login_pairs(items):
+            if items[i]['content'] != LOGIN_MASK:
+                items[i]['content'] = LOGIN_MASK
+                changed = True
+    return changed
+
+
 def clean_cached(m):
-    """Re-apply the current safe_text to an already normalized message (idempotent)."""
+    """Re-apply the current safe_text and login masking to an already normalized message (idempotent)."""
     out = dict(m, content=safe_text(m.get('content', '')))
     if m.get('quotedMessage'):
         out['quotedMessage'] = clean_cached(m['quotedMessage'])
     if m.get('forwardMessages'):
         out['forwardMessages'] = [clean_cached(x) for x in m['forwardMessages']]
-    return out
+    return mask_message(out)
+
+
+def scrub_pages(path, state):
+    """Mask login pairs that span messages or pages in the saved pages; keeps receipts in step. True if changed."""
+    pages = [(page, read(path / page['file'])) for page in state['pages']]
+    for page, data in pages:
+        need(digest(data) == page['sha'], '分页文件改变，停止覆盖审阅记录')
+    before = [json.dumps(data, sort_keys=True, ensure_ascii=False) for _, data in pages]
+    mask_sequence([m for _, data in pages for m in data['messages']])
+    changed = False
+    for (page, data), old in zip(pages, before):
+        if json.dumps(data, sort_keys=True, ensure_ascii=False) != old:
+            page.setdefault('fetchedSha', page['sha'])
+            save(path / page['file'], data)
+            page['sha'] = digest(data)
+            changed = True
+    return changed
 
 
 def remask(path, state, conversation_filter=None):
@@ -237,12 +359,15 @@ def remask(path, state, conversation_filter=None):
         need(digest(data) == page['sha'], '分页文件改变，停止覆盖审阅记录')
         cleaned = dict(data, messages=[clean_cached(m) for m in data['messages']])
         if cleaned != data:
+            page.setdefault('fetchedSha', page['sha'])
             save(path / page['file'], cleaned)
             page['sha'] = digest(cleaned)
             changed = True
+    changed = scrub_pages(path, state) or changed
     pending = state.get('pendingPage')
     if pending and pending.get('union'):
         union = [clean_cached(m) for m in pending['union']]
+        mask_sequence(union)
         if union != pending['union']:
             pending['union'] = union
             changed = True
@@ -251,6 +376,13 @@ def remask(path, state, conversation_filter=None):
         changed = True
     if not changed or state['phase'] != 'review':
         return changed
+    rebuild(path, state)
+    return True
+
+
+def rebuild(path, state):
+    """Re-chunk from the saved pages after their text changed. Notes survive for chunks whose text is unchanged;
+    changed chunks must be read again, and a candidate built from the old text is discarded."""
     old = {(c['conversationId'], c['offset'], c['text']): c['id'] for c in read(path / 'chunks.json')}
     reviewed = state['reviewed']
     prepare(path, state)
@@ -263,7 +395,44 @@ def remask(path, state, conversation_filter=None):
     state['presented'] = {}
     if state.pop('candidateHash', None) is not None:
         (path / 'delta.json').unlink(missing_ok=True)
-    return True
+
+
+SENSITIVE_MASK = '[阅读时发现的敏感内容已隐藏，按消息ID核对]'
+
+
+def redact(runs, key, indexes):
+    """The reader found something the rules missed (a password, a key): hide those whole messages, including
+    quoted and forwarded parts, in every cache, and keep going instead of stopping the run. Only message IDs
+    are recorded, never the hidden text."""
+    need(isinstance(indexes, list) and indexes and all(type(i) is int for i in indexes), '指定要隐藏的消息编号')
+    def hide(m):
+        out = dict(m, content=SENSITIVE_MASK)
+        if m.get('quotedMessage'):
+            out['quotedMessage'] = hide(m['quotedMessage'])
+        if m.get('forwardMessages'):
+            out['forwardMessages'] = [hide(x) for x in m['forwardMessages']]
+        return out
+    with locked(runs):
+        path, state = load_run(runs, key)
+        need(state['phase'] == 'review', '分页完成后、审阅阶段才能隐藏消息')
+        rows = {m['index']: m for m in read(path / 'messages.json')}
+        need(all(i in rows for i in indexes), '消息编号不在本轮')
+        targets = {(rows[i]['openConversationId'], rows[i]['openMessageId']) for i in indexes}
+        for page in state['pages']:
+            data = read(path / page['file'])
+            need(digest(data) == page['sha'], '分页文件改变，停止覆盖审阅记录')
+            hidden = [hide(m) if (m['openConversationId'], m['openMessageId']) in targets else m for m in data['messages']]
+            if hidden != data['messages']:
+                page.setdefault('fetchedSha', page['sha'])
+                data = dict(data, messages=hidden)
+                save(path / page['file'], data)
+                page['sha'] = digest(data)
+        rebuild(path, state)
+        state['redacted'] = sorted(set(state.get('redacted', [])) | {f'{c}/{m}' for c, m in targets})
+        state['lastProgressAt'] = stamp()
+        save(path / 'review.json', state)
+        reread = [c['id'] for c in state['chunks'] if c['id'] not in state['reviewed']]
+        return {**progress(state), 'hiddenMessages': len(targets), 'reread': reread}
 
 
 def normalize_message(m, group):
@@ -278,7 +447,7 @@ def normalize_message(m, group):
         result['quotedMessage'] = normalize_message(quoted, {'openConversationId': cid})
     if m.get('forwardMessages'):
         result['forwardMessages'] = [normalize_message(x, {'openConversationId': cid}) for x in m['forwardMessages']]
-    return result
+    return mask_message(result)
 
 
 def message_body(m):
@@ -364,6 +533,7 @@ def ingest(runs, key, cursor, response):
         need(isinstance(groups, list), '分页响应缺少会话列表')
         need(all(isinstance(g, dict) and isinstance(g.get('messages'), list) for g in groups), '会话消息列表格式错误')
         messages = [normalize_message(m, g) for g in groups for m in g.get('messages', [])]
+        mask_sequence(messages)
         begin = dt.datetime.fromisoformat(state['start']).replace(tzinfo=None)
         end = dt.datetime.fromisoformat(state['end']).replace(tzinfo=None)
         need(all(begin <= dt.datetime.fromisoformat(m['createTime']).replace(tzinfo=None) <= end for m in messages), '消息超出固定扫描边界')
@@ -371,7 +541,7 @@ def ingest(runs, key, cursor, response):
         hashed = digest(normalized)
         prior = next((p for p in state['pages'] if p['cursor'] == cursor), None)
         if prior:
-            need(prior['sha'] == hashed, '重试同一页返回不同内容；保留已有记录并报告')
+            need(prior.get('fetchedSha', prior['sha']) == hashed, '重试同一页返回不同内容；保留已有记录并报告')
             return progress(state)
         need(cursor == state['cursor'], '游标与已保存进度不同，不能跳页')
         if data['hasMore']:
@@ -402,6 +572,7 @@ def ingest(runs, key, cursor, response):
         if state.get('verifyMessagePages'):
             receipt['verification'] = {'attempts': pending['attempts'], 'confirmations': pending['confirmations']}
         state['pages'].append(receipt)
+        scrub_pages(path, state)   # a pair can straddle this page and an earlier one
         state['cursor'] = normalized['nextCursor'] if data['hasMore'] else None
         if not data['hasMore']:
             prepare(path, state)
@@ -409,6 +580,18 @@ def ingest(runs, key, cursor, response):
         state.pop('lastError', None)
         save(path / 'review.json', state)
         return progress(state)
+
+
+def leaked_login(text):
+    """Last check on text about to leave the program: an inline pair, or neighbouring message lines that pair up."""
+    rows, bodies = [], []
+    for line in text.splitlines():
+        m = re.match(r'\[\d+\] (\d{4}-\d{2}-\d{2} [\d:]+) (.*?): (.*)$', line)
+        if m:
+            rows.append({'createTime': m.group(1), 'senderOpenDingTalkId': m.group(2), 'content': m.group(3)})
+        body = m.group(3) if m else re.sub(r'^(?:引用|转发 [\d: -]+) [^:]*: ', '', line)
+        bodies.append(body)
+    return any(inline_login(b) for b in bodies) or bool(login_pairs(rows, same_sender=True))
 
 
 def next_chunks(runs, key, count=1):
@@ -421,6 +604,7 @@ def next_chunks(runs, key, count=1):
         expected = {c['id']: c['sha'] for c in state['chunks']}
         for c in pending:
             need(digest({k: v for k, v in c.items() if k != 'sha'}) == expected.get(c['id']) == c['sha'], '阅读文本改变')
+            need(not leaked_login(c['text']), '段落仍含疑似登录材料，停止输出；先修复遮蔽规则再续接')
             state['presented'][c['id']] = c['sha']
         save(path / 'review.json', state)
         return {'progress': progress(state), 'chunks': pending}
@@ -540,7 +724,8 @@ def stage_candidate(runs, key, document, config):
             source_keys = {(s['conversationId'], s['messageId']) for s in task['sources']}
             for source in sources:
                 need(all(isinstance(source.get(k), str) for k in ['chat', 'time', 'quote', 'messageId', 'conversationId']), '来源缺少稳定身份、时间或正文')
-                source['quote'] = safe_text(source['quote'])[:600]
+                source['quote'] = mask_inline(safe_text(source['quote']))[:600]
+                need(not leaked_login(source['quote']), '来源引用含疑似登录材料，停止生成候选')
                 source_key = (source['conversationId'], source['messageId'])
                 if source_key not in source_keys:
                     task['sources'].append(source); source_keys.add(source_key)
@@ -601,7 +786,8 @@ def record_failure(runs, key, reason, evidence=None, expected_session=None, expe
         state['lastError'] = {'at': stamp(), 'reason': reason, 'phase': state['phase']}
         state['stopBlocker'] = blocker
         save(path / 'review.json', state)
-        sync = {'state': 'partial', 'mode': state['mode'],
+        sync = {'state': 'partial', 'mode': state['mode'], 'failedRunId': key,
+                'failedRunThreadId': state.get('completionSessionId') or '',
                 'scope': f"{state['start']} 至 {state['end']}；已保存{len(state['pages'])}页，已审阅{len(state['reviewed'])}/{len(state['chunks'])}段；进度保留。",
                 'message': f"整理未完成：{reason}；下次从原进度继续。"}
         merge(pathlib.Path(state['root']), {'tasks': [], 'sync': sync})
@@ -632,7 +818,7 @@ def finish(runs, key, payload, message):
         else:
             skipped = [v['note'] for v in state['checks'].values() if v.get('skipped')]
             sync = {**payload.get('sync', {}), 'state': 'ok', 'mode': state['mode'],
-                    'scannedThrough': state['end'], 'reviewRunId': key,
+                    'scannedThrough': state['end'], 'reviewRunId': key, 'failedRunId': None, 'failedRunThreadId': None,
                     'scope': f"{state['start']} 至 {state['end']}；{len(state['pages'])}页、{state.get('messageCount', 0)}条、{state.get('conversationCount', 0)}个会话；{len(state['chunks'])}段全文及全部必需核对已完成；" + skipped_note(state) + "图片、语音、文件仅按影响结论的需要解析。",
                     'message': message + ('；日报同步跳过：' + '；'.join(skipped) if skipped else '')}
             validate_ready(runs, key, sync, old.get('sync', {}))
@@ -688,7 +874,7 @@ def main():
     parser.add_argument('--project', type=pathlib.Path, default=HERE)
     sub = parser.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('start'); p.add_argument('--end'); p.add_argument('--full', action='store_true')
-    for cmd in ['status', 'fetch-command', 'ingest', 'next', 'ack', 'check', 'stage', 'finish', 'fail']:
+    for cmd in ['status', 'fetch-command', 'ingest', 'next', 'ack', 'check', 'stage', 'finish', 'fail', 'redact']:
         p = sub.add_parser(cmd); p.add_argument('--run', required=True)
         if cmd == 'ingest': p.add_argument('--cursor', required=True)
         if cmd == 'next': p.add_argument('--count', type=int, default=1)
@@ -696,6 +882,7 @@ def main():
         if cmd == 'check':
             p.add_argument('--key', required=True); p.add_argument('--note', required=True); p.add_argument('--skipped', action='store_true')
         if cmd == 'finish': p.add_argument('--message')
+        if cmd == 'redact': p.add_argument('--index', type=int, action='append', required=True)
         if cmd == 'fail':
             p.add_argument('--reason', required=True)
             p.add_argument('--evidence', type=pathlib.Path)
@@ -711,6 +898,7 @@ def main():
         elif args.cmd == 'ack': value = acknowledge(runs, args.run, read(args.input))
         elif args.cmd == 'check': value = check_stage(runs, args.run, args.key, args.note, args.skipped)
         elif args.cmd == 'stage': value = stage_candidate(runs, args.run, read(args.input), read(args.project / 'config.json'))
+        elif args.cmd == 'redact': value = redact(runs, args.run, args.index)
         elif args.cmd == 'fail':
             state = load_run(runs, args.run)[1]
             caller = os.environ.get('CODEX_THREAD_ID') if state.get('completionSessionId') else None

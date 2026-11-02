@@ -90,6 +90,10 @@ struct Todo: Codable, Identifiable {
     var reportTodo: ReportTodo?
     static let confirmPrefixes = ["待确认：", "待确认:", "待确认 "]
     var isUnconfirmed: Bool { needsConfirm ?? title.hasPrefix("待确认") }
+    /// Came only from the retired daily-report platform, with no DingTalk message behind it (mirrors update_inbox.report_only).
+    var isReportOnly: Bool {
+        !sources.isEmpty && sources.allSatisfy { $0.conversationType == "report" || $0.conversationId.hasPrefix("report:") }
+    }
     var displayTitle: String {
         for prefix in Todo.confirmPrefixes where title.hasPrefix(prefix) { return String(title.dropFirst(prefix.count)) }
         return title
@@ -103,12 +107,35 @@ struct SyncInfo: Codable {
     var schedule: String?
     var mode: String?
     var runThreadId: String?
+    /// Set while a run is stuck, so “打开整理对话” opens the run that failed, not the last one that worked.
+    var failedRunId: String?
+    var failedRunThreadId: String?
 }
 struct Inbox: Codable {
     var schemaVersion: Int
     var updatedAt: String?
     var tasks: [Todo]
     var sync: SyncInfo?
+    /// Items that could not be read. One malformed item no longer hides the whole new list.
+    var unreadable = 0
+    enum CodingKeys: String, CodingKey { case schemaVersion, updatedAt, tasks, sync }
+}
+/// Decodes one list element without failing the whole array.
+private struct LossyTodo: Decodable {
+    let value: Todo?
+    init(from decoder: Decoder) throws { value = try? Todo(from: decoder) }
+}
+extension Inbox {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
+        updatedAt = try? c.decodeIfPresent(String.self, forKey: .updatedAt)
+        sync = try? c.decodeIfPresent(SyncInfo.self, forKey: .sync)
+        let all = try c.decode([LossyTodo].self, forKey: .tasks)
+        // DingTalk only: items that came solely from the daily-report platform are not shown.
+        tasks = all.compactMap(\.value).filter { !$0.isReportOnly }
+        unreadable = all.filter { $0.value == nil }.count
+    }
 }
 /// One entry per task in actions.json. Written only by this window; the整理 job reads it as user feedback.
 struct LocalAction: Codable, Equatable {
@@ -757,6 +784,8 @@ func isoLocalText(_ date: Date) -> String { isoLocal.string(from: date) }
         return parts.joined(separator: " · ")
     }
     var runURL: URL? {
+        let failed = inbox.sync?.state == "error" || inbox.sync?.state == "partial"
+        if failed, let id = inbox.sync?.failedRunThreadId, !id.isEmpty { return URL(string: "codex://threads/\(id)") }
         if let id = inbox.sync?.runThreadId, !id.isEmpty { return URL(string: "codex://threads/\(id)") }
         if let s = appConfig.conversationURL, !s.isEmpty { return URL(string: s) }
         return nil
@@ -951,7 +980,6 @@ struct TodoRow: View {
                 if todo.isUnconfirmed { badge("待确认", calm) }
                 if todo.priority == 0 && todo.category != "waiting" { badge("优先", accent) }
                 if store.isHandedOff(todo) { badge("Codex 跟进", calm) }
-                if todo.reportTodo != nil { badge("日报", accent) }
             }
             if let dueText {
                 Text(dueText).font(.system(size: 10, weight: .medium))
@@ -1264,6 +1292,7 @@ struct MainView: View {
                 }
                 if tab == 2 && !store.items(2).isEmpty { searchField }
                 if loadedConfig == nil { alertBar("缺少 config.json，正在使用默认设置。请交给 Codex 重新构建。") }
+                if store.inbox.unreadable > 0 { alertBar("有 \(store.inbox.unreadable) 件事项格式有误，暂时没显示；其他事项正常。请交给 Codex 排查。") }
                 if let error = store.saveError ?? store.loadError { alertBar(error) }
                 else if store.inbox.sync?.state == "error" || store.inbox.sync?.state == "partial" {
                     alertBar(store.inbox.sync?.message ?? "这次读取不完整，已保留旧待办。")

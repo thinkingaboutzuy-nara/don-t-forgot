@@ -232,6 +232,7 @@ def verify():
         review.record_failure(runs, run, '合成网络故障，服务恢复后继续剩余审阅。')
         assert (path / 'pages').exists() and (path / 'chunks.json').exists()
         assert review.read(root / 'inbox.json')['sync']['scannedThrough'] == '2026-10-20T08:00:00+08:00'
+        assert review.read(root / 'inbox.json')['sync']['failedRunId'] == run, 'the failure points at the failing run'
         resumed = review.start(runs, config, root)
         assert resumed['reviewed'] == 1
         rejects(lambda: review.finish(runs, run, {}, '未审阅完'), 'review incomplete')
@@ -261,6 +262,7 @@ def verify():
         assert result['recovered'] and review.load_run(runs, run)[1]['phase'] == 'complete'
         assert not (path / 'pages').exists() and not (path / 'messages.json').exists()
         assert review.read(root / 'inbox.json')['sync']['scannedThrough'] == '2026-10-20T09:00:00+08:00'
+        assert review.read(root / 'inbox.json')['sync']['failedRunId'] is None, 'success clears the failure pointer'
         assert (root / 'actions.json').read_bytes() == manual
         rejects(lambda: review.finish(runs, run, {'tasks': []}, '另一份增量'), 'replay altered payload')
         followup = review.start(runs, config, root, '2026-10-20T10:00:00+08:00')
@@ -416,7 +418,131 @@ def verify_redaction_gaps():
     print('PASS: labeled short keys, AWS keys, base64 and 20+ mixed keys; file names and business text kept')
 
 
+def verify_login_pairs():
+    """Unlabelled login material split over messages (account, then short password) never reaches caches or output."""
+    account, password = 'fixture19@example.test', 'Aa12Bb34'   # reserved domain and generated value, not real
+    secret = lambda value: account in json.dumps(value, ensure_ascii=False) or password in json.dumps(value, ensure_ascii=False)
+    def msg(mid, time, content, sender='fixture-other', **extra):
+        return {'openMessageId': mid, 'createTime': '2026-11-01 ' + time, 'sender': '演示同事', 'senderOpenDingTalkId': sender,
+                'content': content, **extra}
+    def response(messages, more=False, cursor=''):
+        return {'success': True, 'result': {'hasMore': more, 'nextCursor': cursor, 'conversationMessagesList': [
+            {'openConversationId': 'pair-chat', 'title': '演示同事', 'singleChat': True, 'messages': messages}]}}
+    def fresh(tmp, name, verify=False):
+        project = pathlib.Path(tmp) / name; root = project / 'data'; runs = project / 'work/runs'
+        config = {'timeZone': 'Asia/Taipei', 'profile': 'fixture:person', 'earliestDate': '2026-10-01',
+                  'dataDirectory': str(root), 'selfOpenDingTalkId': 'fixture-self', 'verifyMessagePages': verify}
+        return runs, root, config, review.start(runs, config, root, '2026-11-01T14:00:00+08:00')['run']
+    def cached(runs, run):
+        files = [*(runs / run / 'pages').glob('*.json'), runs / run / 'messages.json', runs / run / 'chunks.json']
+        return [review.read(f) for f in files if f.exists()]
+
+    # Business text stays readable: a lone address, a lone model name, a sentence next to an address.
+    assert review.inline_login('请把报价发到 ' + account) == [] and review.inline_login('iPhone15') == []
+    alone = [review.normalize_message(m, {'openConversationId': 'c', 'singleChat': True}) for m in [
+        msg('b1', '09:00:00', '我的邮箱 ' + account), msg('b2', '09:00:05', 'iPhone15 到了，订单 20261015-003'),
+        msg('b3', '09:30:00', 'iPhone15')]]
+    assert not review.mask_sequence(alone) and alone[0]['content'].endswith(account) and alone[2]['content'] == 'iPhone15'
+    # Same message, and a login cue followed by a bare token.
+    assert password not in review.mask_inline(account + ' ' + password) and account not in review.mask_inline(account + '\n' + password)
+    cue = [review.normalize_message(m, {'openConversationId': 'c', 'singleChat': True}) for m in [
+        msg('c1', '10:00:00', '后台登录用下面这个'), msg('c2', '10:00:04', password)]]
+    assert review.mask_sequence(cue) and cue[1]['content'] == review.LOGIN_MASK and cue[0]['content'] == '后台登录用下面这个'
+    # Quoted and forwarded parts of one message.
+    nested = review.normalize_message(msg('n1', '11:00:00', '转给你', quotedMessage=msg('n0', '10:59:00', account),
+                                          forwardMessages=[msg('n2', '10:59:04', password)]), {'openConversationId': 'c'})
+    assert not secret(review.message_body(nested))
+    with tempfile.TemporaryDirectory(prefix='todo-login-') as tmp:
+        # Two messages, one page: nothing persisted, shown or staged; repeating the page is idempotent.
+        runs, root, config, run = fresh(tmp, 'pair', verify=True)
+        page = response([msg('m1', '13:56:05', account), msg('m2', '13:56:09', password)])
+        review.ingest(runs, run, '0', page)
+        assert not secret(review.read(runs / run / 'review.json')), 'page awaiting a second read is stored masked'
+        review.ingest(runs, run, '0', page)
+        assert not secret(cached(runs, run)) and not secret(review.read(runs / run / 'review.json'))
+        shown = review.next_chunks(runs, run)['chunks']
+        assert not secret(shown) and review.LOGIN_MASK in shown[0]['text']
+        review.acknowledge(runs, run, [{'id': c['id'], 'sha': c['sha'], 'note': '已阅读合成的疑似登录材料，未记录原值。'} for c in shown])
+        review.stage_candidate(runs, run, {'summary': '合成来源', 'tasks': [{'id': 'fixture-task', 'fields': {
+            'title': '核对演示服务', 'detail': '合成回归。', 'category': 'action', 'priority': 2}, 'messageIndexes': [1, 2]}]}, config)
+        assert not secret(review.read(runs / run / 'delta.json'))
+        assert review.clean_cached(review.read(runs / run / 'messages.json')[0]) == review.read(runs / run / 'messages.json')[0]
+        # Split across two pages: the earlier page is rewritten once the pair is complete; retrying it still matches.
+        runs, root, config, run = fresh(tmp, 'pages')
+        first = response([msg('p1', '13:56:05', account)], True, 'next')
+        review.ingest(runs, run, '0', first)
+        assert account in json.dumps(cached(runs, run), ensure_ascii=False), 'a lone address is kept until a pair appears'
+        review.ingest(runs, run, 'next', response([msg('p2', '13:56:09', password)], True, 'last'))
+        assert not secret(cached(runs, run)) and not secret(review.read(runs / run / 'review.json'))
+        review.ingest(runs, run, '0', first)   # same cursor again: compared with what was fetched, not what was masked
+        review.ingest(runs, run, 'last', response([msg('p3', '13:59:00', '收到，谢谢')]))
+        assert not secret(cached(runs, run)) and not secret(review.next_chunks(runs, run)['chunks'])
+        # A cache written before this fix: blocked at output, cleaned on resume, unchanged chunk keeps its note.
+        runs, root, config, run = fresh(tmp, 'old')
+        saved = review.mask_sequence, review.mask_message, review.scrub_pages
+        review.mask_sequence, review.mask_message, review.scrub_pages = (lambda m: False), (lambda m: m), (lambda p, s: False)
+        try:
+            review.ingest(runs, run, '0', {'success': True, 'result': {'hasMore': False, 'nextCursor': '', 'conversationMessagesList': [
+                {'openConversationId': 'a-chat', 'title': '演示', 'singleChat': True, 'messages': [msg('o0', '09:00:00', '请核对演示事项。')]},
+                {'openConversationId': 'pair-chat', 'title': '演示同事', 'singleChat': True,
+                 'messages': [msg('o1', '13:56:05', account), msg('o2', '13:56:09', password)]}]}})
+        finally:
+            review.mask_sequence, review.mask_message, review.scrub_pages = saved
+        assert secret(cached(runs, run)), 'fixture should start with a leaked cache'
+        clean = review.next_chunks(runs, run)['chunks']
+        assert clean[0]['conversationId'] == 'a-chat'
+        review.acknowledge(runs, run, [{'id': clean[0]['id'], 'sha': clean[0]['sha'], 'note': '已阅读合成的普通消息。'}])
+        rejects(lambda: review.next_chunks(runs, run), 'leaked chunk must not be shown')
+        assert review.start(runs, config, root, '2026-11-01T14:30:00+08:00')['run'] == run
+        assert not secret(cached(runs, run))
+        state = review.read(runs / run / 'review.json')
+        assert list(state['reviewed']) == [clean[0]['id']] and state['remaskedAt']
+        again = review.next_chunks(runs, run)['chunks']
+        assert again[0]['conversationId'] == 'pair-chat' and not secret(again)
+    print('PASS: login pairs in one message, across messages and pages, quoted/forwarded, after a login cue; old cache blocked then cleaned; business text kept')
+
+
+def verify_redact_and_dingtalk_only():
+    """A reader can hide a message the rules missed and keep going; runs no longer include the daily-report check."""
+    hidden = 'HiddenPw9x'   # synthetic value the rules let through on its own
+    with tempfile.TemporaryDirectory(prefix='todo-redact-') as tmp:
+        project = pathlib.Path(tmp); root = project / 'data'; runs = project / 'work/runs'
+        config = {'timeZone': 'Asia/Taipei', 'profile': 'fixture:person', 'earliestDate': '2026-10-01',
+                  'dataDirectory': str(root), 'selfOpenDingTalkId': 'fixture-self'}
+        run = review.start(runs, config, root, '2026-11-01T14:00:00+08:00')['run']
+        state = review.read(runs / run / 'review.json')
+        assert 'report' not in state['requiredChecks'], state['requiredChecks']
+        def chat(cid, content):
+            return {'openConversationId': cid, 'title': cid, 'singleChat': True, 'messages': [
+                {'openConversationId': cid, 'openMessageId': cid + '-m', 'createTime': '2026-11-01 10:00:00',
+                 'sender': '演示同事', 'senderOpenDingTalkId': 'fixture-person', 'content': content,
+                 'forwardMessages': [{'openMessageId': cid + '-f', 'createTime': '2026-11-01 09:59:00', 'sender': '演示同事',
+                                      'senderOpenDingTalkId': 'fixture-person', 'content': '转发里也有 ' + hidden}] if cid == 'b-chat' else []}]}
+        review.ingest(runs, run, '0', {'success': True, 'result': {'hasMore': False, 'nextCursor': '',
+                      'conversationMessagesList': [chat('a-chat', '请核对演示事项。'), chat('b-chat', '新的密钥是 ' + hidden)]}})
+        first = review.next_chunks(runs, run)['chunks']
+        review.acknowledge(runs, run, [{'id': c['id'], 'sha': c['sha'], 'note': '已阅读合成的普通消息。'} for c in first])
+        rejects(lambda: review.redact(runs, run, [99]), 'unknown index')
+        index = next(m['index'] for m in review.read(runs / run / 'messages.json') if m['openConversationId'] == 'b-chat')
+        result = review.redact(runs, run, [index])
+        assert result['hiddenMessages'] == 1 and len(result['reread']) == 1
+        for f in [*(runs / run / 'pages').glob('*.json'), runs / run / 'messages.json', runs / run / 'chunks.json', runs / run / 'review.json']:
+            assert hidden not in f.read_text(encoding='utf-8'), f.name
+        state = review.read(runs / run / 'review.json')
+        assert state['redacted'] == ['b-chat/b-chat-m'] and [c['id'] for c in first] == list(state['reviewed'])
+        shown = review.next_chunks(runs, run)['chunks']
+        assert shown[0]['conversationId'] == 'b-chat' and review.SENSITIVE_MASK in shown[0]['text']
+        # A run started before the change still lists the daily-report check; resuming drops it.
+        state['requiredChecks'].append('report'); review.save(runs / run / 'review.json', state)
+        review.start(runs, config, root, '2026-11-01T14:30:00+08:00')
+        assert 'report' not in review.read(runs / run / 'review.json')['requiredChecks']
+        rejects(lambda: review.check_stage(runs, run, 'report', '日报服务已停用，不再核对。', True), 'retired check')
+    print('PASS: redact hides a missed secret everywhere and keeps other notes; daily-report check retired')
+
+
 if __name__ == '__main__':
+    verify_redact_and_dingtalk_only()
+    verify_login_pairs()
     verify_redaction_gaps()
     verify_scope_and_groups()
     verify_remask_on_resume()

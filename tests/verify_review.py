@@ -278,7 +278,57 @@ def verify():
     print('PASS: resumable pages/read progress, bounded lossless chunks, identity/cursor guards, completion gate, manual state, crash recovery, cleanup')
 
 
+def verify_api_redaction():
+    # Synthetic values cover the leaked shapes without copying real credentials.
+    long_key = 'sk-' + 'Fixture9Only_' * 12
+    bare_key = 'Fixture9Only' * 11
+    dotted_key = 'FixturePrefix9OnlyABC.' + bare_key
+    samples = [long_key, 'https://example.test/provider\n\n' + bare_key,
+               '请配置 API_KEY="' + bare_key + '"，然后核对服务。',
+               '测试值 ' + long_key + ' 配好后再确认。']
+    for text in samples:
+        masked = review.safe_text(text)
+        assert long_key not in masked and bare_key not in masked, 'API credential body was not redacted'
+        assert review.safe_text(masked) == masked, 'redaction must be idempotent'
+    assert '然后核对服务' in review.safe_text(samples[2]), 'business context must survive API-key removal'
+    business = '请在2026-11-02核对接口与订单20261015-003，保留消息依据。'
+    assert review.safe_text(business) == business
+    assert 'FixturePrefix' not in review.safe_text('[链接]\n\n' + dotted_key), 'dotted key prefix leaked'
+    letters_key = 'FixtureLettersOnly' * 8
+    assert letters_key not in review.safe_text('请配置API_KEY="' + letters_key + '"，然后核对服务。'), 'Chinese-adjacent API key leaked'
+    embedded_dotted = '.'.join(['Fixture9OnlyABC'] * 4)
+    assert embedded_dotted not in review.safe_text('凭证 ' + embedded_dotted + ' 已配置'), 'embedded dotted key leaked'
+    msg = {'openMessageId': 'fixture-stable-id', 'createTime': '2026-11-02 09:00:00',
+           'sender': '演示同事', 'senderOpenDingTalkId': 'fixture-person', 'content': samples[1]}
+    msg['quotedMessage'] = {**msg, 'content': long_key}
+    msg['forwardMessages'] = [{**msg, 'content': samples[2]}]
+    normalized = review.normalize_message(msg, {'openConversationId': 'fixture-chat', 'singleChat': True})
+    assert normalized['openMessageId'] == msg['openMessageId']
+    body = review.message_body(normalized)
+    assert long_key not in body and bare_key not in body, 'quoted/forwarded credentials leaked'
+    with tempfile.TemporaryDirectory(prefix='todo-redaction-') as tmp:
+        project = pathlib.Path(tmp); root = project / 'data'; runs = project / 'work/runs'
+        config = {'timeZone': 'Asia/Taipei', 'profile': 'fixture:person', 'earliestDate': '2026-10-01',
+                  'dataDirectory': str(root), 'selfOpenDingTalkId': 'fixture-self'}
+        run = review.start(runs, config, root, '2026-11-02T09:00:00+08:00')['run']
+        response = {'success': True, 'result': {'hasMore': False, 'conversationMessagesList': [
+            {'openConversationId': 'fixture-chat', 'title': '演示', 'singleChat': True, 'messages': [msg]}]}}
+        review.ingest(runs, run, '0', response)
+        shown = review.next_chunks(runs, run)['chunks']
+        for f in [*(runs / run / 'pages').glob('*.json'), runs / run / 'messages.json', runs / run / 'chunks.json']:
+            cached = f.read_text(encoding='utf-8')
+            assert long_key not in cached and bare_key not in cached, 'credential persisted in source cache'
+        assert long_key not in json.dumps(shown) and bare_key not in json.dumps(shown)
+        review.acknowledge(runs, run, [{'id': c['id'], 'sha': c['sha'], 'note': '已完整阅读合成去敏消息并核对业务说明。'} for c in shown])
+        review.stage_candidate(runs, run, {'summary': '合成去敏来源核对', 'tasks': [
+            {'id': 'fixture-new', 'fields': {'title': '核对服务', 'detail': '核对配置后的服务。', 'category': 'action', 'priority': 2}, 'messageIndexes': [1]}]}, config)
+        candidate = (runs / run / 'delta.json').read_text(encoding='utf-8')
+        assert long_key not in candidate and bare_key not in candidate, 'credential leaked to source quote'
+    print('PASS: long and embedded API credentials, URL-plus-key, nested sources, context and stable IDs')
+
+
 if __name__ == '__main__':
+    verify_api_redaction()
     verify_fixed_candidate()
     verify_utf8_cli()
     verify()

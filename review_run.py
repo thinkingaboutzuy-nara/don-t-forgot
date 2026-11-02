@@ -169,6 +169,18 @@ def safe_text(text):
     if re.search(r'(?:密码|口令|验证码|password|secret|bearer|private.key|access.token)', text, re.I) or re.fullmatch(r'\s*[0-9]{4,8}\s*', text):
         return '[登录材料已移除；需要业务依据时按消息ID另查]'
     text = re.sub(r'(?:https?://|dingtalk://)[^\s\]\)]+', '[链接]', text)
+    # API keys can be embedded, longer than 100 characters, or follow a URL on
+    # another line. Only inspect message bodies; stable message IDs stay intact.
+    text = re.sub(r'(?m)^[ \t]*[A-Za-z0-9_./+=:-]{32,}[ \t]*$', '[API凭证或裸标识已隐藏，按消息ID核对]', text)
+    text = re.sub(r'''(?ix)((?<![A-Za-z0-9_])api[ _-]?key\s*[:=：]\s*["']?)[^\s"'`,;，；]+''',
+                  r'\1[API凭证已移除]', text)
+    text = re.sub(r'(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{12,}', '[API凭证已移除]', text)
+    text = re.sub(r'(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*[A-Za-z])(?=[A-Za-z0-9_.-]*\d)[A-Za-z0-9_.-]{32,}(?![A-Za-z0-9_.-])',
+                  '[长凭证或裸标识已隐藏，按消息ID核对]', text)
+    text = re.sub(r'[A-Za-z0-9_./+=:-]+\[(?:API凭证已移除|长凭证或裸标识已隐藏，按消息ID核对)\]',
+                  '[API凭证已移除]', text)
+    text = re.sub(r'\[(?:API凭证已移除|长凭证或裸标识已隐藏，按消息ID核对)\][A-Za-z0-9_./+=:-]+',
+                  '[API凭证已移除]', text)
     if re.fullmatch(r'\s*(?:\d{8,20}\s+)?(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{10,100}\s*', text):
         return '[登录材料或裸标识已隐藏，按消息ID核对]'
     if re.fullmatch(r'(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9])[\x21-\x7e]{8,120}', text.strip()):

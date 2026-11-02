@@ -17,7 +17,7 @@ python3 tests/verify_store.py         # 窗口状态逻辑
 python3 tests/verify_merge.py         # 清单合并器
 python3 tests/verify_review.py        # 整理续接与完成检查
 python3 tests/verify_stop_guard.py    # 自动续接、真实阻塞与无进展边界
-python3 build_app.py                  # 生成并签名 别忘了.app
+python3 build_app.py                  # 生成并签名 别忘了.app，并装到“应用程序”（--no-install 只构建）
 ```
 
 ## 整理入口

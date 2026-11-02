@@ -25,7 +25,7 @@ jobs:
       - name: Build app
         run: |
           cp config.example.json config.json
-          python3 build_app.py
+          python3 build_app.py --no-install
           plutil -p 别忘了.app/Contents/Info.plist | grep -E 'ShortVersion|CFBundleVersion'
           test -f 别忘了.app/Contents/Resources/changelog.md
       - name: Screenshots

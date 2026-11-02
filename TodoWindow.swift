@@ -1629,6 +1629,19 @@ struct MainView: View {
 final class FloatingPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+    /// Borderless windows are not kept on screen by AppKit; never let the panel be taller or wider than the visible area.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        guard let visible = (screen ?? self.screen ?? NSScreen.main)?.visibleFrame else { return frameRect }
+        return fitted(frameRect, in: visible)
+    }
+    func fitted(_ rect: NSRect, in visible: NSRect) -> NSRect {
+        var r = rect
+        r.size.width = min(r.width, visible.width)
+        r.size.height = min(r.height, visible.height)
+        r.origin.x = min(max(r.minX, visible.minX), visible.maxX - r.width)
+        r.origin.y = min(max(r.minY, visible.minY), visible.maxY - r.height)
+        return r
+    }
 }
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     var panel: FloatingPanel!
@@ -1647,7 +1660,9 @@ final class FloatingPanel: NSPanel {
             let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
             if let other = others.first { other.activate(); NSApp.terminate(nil); return }
         }
-        NSApp.setActivationPolicy(.accessory)
+        // A regular app: Dock icon, ⌘Tab and an app menu, so a closed window can always be brought back.
+        NSApp.setActivationPolicy(testMode ? .accessory : .regular)
+        if !testMode { NSApp.mainMenu = mainMenu() }
         store = TodoStore(root: root)
         if !testMode {
             let defaults = UserDefaults.standard
@@ -1668,7 +1683,15 @@ final class FloatingPanel: NSPanel {
         panel.minSize = NSSize(width: 340, height: 420); panel.maxSize = NSSize(width: 550, height: 1000)
         panel.delegate = self
         if !testMode { panel.setFrameAutosaveName("DingTalkTodoWindow") }
-        panel.contentView = NSHostingView(rootView: MainView(store: store, settings: settings))
+        let host = NSHostingView(rootView: MainView(store: store, settings: settings))
+        // The window decides its own size and the list scrolls inside it. With the default sizing the content's
+        // ideal height (every card) drove the window taller than the screen and stopped it from being shrunk.
+        host.sizingOptions = []
+        panel.contentView = host
+        fitOnScreen()
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.fitOnScreen() }
+        }
         settings.resize = { [weak self] in self?.resize() }
         settings.pinChanged = { [weak self] in guard let self else { return }; self.panel.level = self.settings.pinned ? .floating : .normal }
         settings.hide = { [weak self] in self?.panel.orderOut(nil) }
@@ -1695,19 +1718,56 @@ final class FloatingPanel: NSPanel {
             statusItem.menu = menu; statusItem.button?.performClick(nil); statusItem.menu = nil
         } else { panel.isVisible ? panel.orderOut(nil) : panel.orderFrontRegardless() }
     }
-    @objc func show() { panel.orderFrontRegardless() }
+    @objc func show() { fitOnScreen(); panel.orderFrontRegardless() }
     @objc func openProject() { if let dir = appConfig.projectDirectory { openURL(URL(fileURLWithPath: dir)) } }
     @objc func quit() { NSApp.terminate(nil) }
     @objc func resetPosition() {
-        if let f = NSScreen.main?.visibleFrame { panel.setFrameOrigin(NSPoint(x: f.maxX - panel.frame.width - 26, y: f.maxY - panel.frame.height - 30)) }
+        if let f = (panel.screen ?? NSScreen.main)?.visibleFrame {
+            let height = settings.collapsed ? 82 : min(620, f.height - 60)
+            panel.setFrame(NSRect(x: f.maxX - panel.frame.width - 26, y: f.maxY - height - 30, width: panel.frame.width, height: height), display: true)
+        }
         show()
+    }
+    var visibleFrame: NSRect { (panel.screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900) }
+    /// Size limits follow the screen the panel is on, and a saved or restored frame is pulled back inside it.
+    func fitOnScreen() {
+        let visible = visibleFrame
+        panel.minSize = NSSize(width: 340, height: settings.collapsed ? 82 : min(420, visible.height))
+        panel.maxSize = NSSize(width: 550, height: settings.collapsed ? 82 : min(1000, visible.height))
+        let fitted = panel.fitted(panel.frame, in: visible)
+        if fitted != panel.frame { panel.setFrame(fitted, display: true) }
     }
     func resize() {
         let old = panel.frame
-        panel.minSize = NSSize(width: 340, height: settings.collapsed ? 82 : 420)
-        panel.maxSize = NSSize(width: 550, height: settings.collapsed ? 82 : 1000)
-        let height: CGFloat = settings.collapsed ? 82 : 620
-        panel.setFrame(NSRect(x: old.minX, y: old.maxY - height, width: old.width, height: height), display: true, animate: false)
+        let height: CGFloat = settings.collapsed ? 82 : min(620, visibleFrame.height)
+        panel.minSize = NSSize(width: 340, height: settings.collapsed ? 82 : min(420, visibleFrame.height))
+        panel.maxSize = NSSize(width: 550, height: settings.collapsed ? 82 : min(1000, visibleFrame.height))
+        panel.setFrame(panel.fitted(NSRect(x: old.minX, y: old.maxY - height, width: old.width, height: height), in: visibleFrame), display: true, animate: false)
+    }
+    func windowDidResize(_ notification: Notification) {
+        let fitted = panel.fitted(panel.frame, in: visibleFrame)
+        if fitted != panel.frame { panel.setFrame(fitted, display: true) }
+    }
+    /// App menu with show / reset / quit, and an Edit menu so ⌘C, ⌘V and ⌘A work in the search and note fields.
+    func mainMenu() -> NSMenu {
+        let bar = NSMenu()
+        let appItem = NSMenuItem(); bar.addItem(appItem)
+        let app = NSMenu()
+        app.addItem(withTitle: "显示待办", action: #selector(show), keyEquivalent: "0").target = self
+        app.addItem(withTitle: "窗口回到右上角", action: #selector(resetPosition), keyEquivalent: "").target = self
+        if appConfig.projectDirectory != nil { app.addItem(withTitle: "打开项目目录", action: #selector(openProject), keyEquivalent: "").target = self }
+        app.addItem(.separator())
+        app.addItem(withTitle: "隐藏\(appConfig.appName)", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        app.addItem(withTitle: "退出\(appConfig.appName)", action: #selector(quit), keyEquivalent: "q").target = self
+        appItem.submenu = app
+        let editItem = NSMenuItem(); bar.addItem(editItem)
+        let edit = NSMenu(title: "编辑")
+        edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        return bar
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { show(); return true }
     func windowShouldClose(_ sender: NSWindow) -> Bool { sender.orderOut(nil); return false }

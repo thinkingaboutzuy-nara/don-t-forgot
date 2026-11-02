@@ -43,6 +43,11 @@ jobs:
           python3 tests/ui_fixture.py "$RUNNER_TEMP/record-data"
           python3 tests/ui_snapshot.py --data "$RUNNER_TEMP/record-data" --out shots --steps \
             "snap,20-main;click,290,596;wait,0.8;snap,21-record;click,200,40;wait,0.5;key,cmd=;wait,0.6;snap,22-full"
+      - name: Window size with a long list
+        run: |
+          python3 tests/ui_fixture.py "$RUNNER_TEMP/long-data" --extra 40
+          python3 tests/ui_snapshot.py --data "$RUNNER_TEMP/long-data" --out shots --steps \
+            "frame,start;pref,openGroups,confirm,waiting,week;wait,1;frame,groups-open;key,cmd=;wait,1;frame,full-length;snap,30-long;height,450;wait,1;frame,after-drag-450;wait,35;frame,after-timer;snap,31-after"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

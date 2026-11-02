@@ -327,7 +327,99 @@ def verify_api_redaction():
     print('PASS: long and embedded API credentials, URL-plus-key, nested sources, context and stable IDs')
 
 
+def verify_remask_on_resume():
+    """A run cached before a redaction fix is re-masked when resumed; unchanged chunks keep their reading notes."""
+    leaked = 'Fixture9Only' * 4
+    with tempfile.TemporaryDirectory(prefix='todo-remask-') as tmp:
+        project = pathlib.Path(tmp); root = project / 'data'; runs = project / 'work/runs'
+        config = {'timeZone': 'Asia/Taipei', 'profile': 'fixture:person', 'earliestDate': '2026-10-01',
+                  'dataDirectory': str(root), 'selfOpenDingTalkId': 'fixture-self'}
+        run = review.start(runs, config, root, '2026-10-21T09:00:00+08:00')['run']
+        response = page('', False, '请核对演示事项。')
+        response['result']['conversationMessagesList'].append({'openConversationId': 'key-chat', 'title': '配置群', 'singleChat': False,
+            'messages': [{'openConversationId': 'key-chat', 'openMessageId': 'key-msg', 'createTime': '2026-10-20 08:30:00',
+                          'sender': '演示同事', 'senderOpenDingTalkId': 'fixture-person', 'content': '测试值 ' + leaked + ' 配好后再确认。'}]})
+        current = review.safe_text
+        review.safe_text = lambda text: text if isinstance(text, str) else ''   # rules as they were before the fix
+        try:
+            review.ingest(runs, run, '0', response)
+        finally:
+            review.safe_text = current
+        cache = runs / run
+        assert leaked in (cache / 'chunks.json').read_text(encoding='utf-8'), 'fixture should start with a leaked cache'
+        shown = review.next_chunks(runs, run, 2)['chunks']
+        review.acknowledge(runs, run, [{'id': c['id'], 'sha': c['sha'], 'note': '已完整阅读合成消息并记录结论。'} for c in shown])
+        clean_id = next(c['id'] for c in shown if c['conversationId'] == 'fixture-chat')
+        resumed = review.start(runs, config, root, '2026-10-21T10:00:00+08:00')
+        assert resumed['run'] == run
+        for f in [*(cache / 'pages').glob('*.json'), cache / 'messages.json', cache / 'chunks.json']:
+            assert leaked not in f.read_text(encoding='utf-8'), f'credential still cached in {f.name}'
+        state = review.read(cache / 'review.json')
+        assert state.get('remaskedAt') and list(state['reviewed']) == [clean_id], state['reviewed']
+        again = review.next_chunks(runs, run)['chunks']
+        assert [c['conversationId'] for c in again] == ['key-chat'] and leaked not in json.dumps(again, ensure_ascii=False)
+        assert review.start(runs, config, root, '2026-10-21T11:00:00+08:00')['run'] == run
+        assert review.read(cache / 'review.json')['remaskedAt'] == state['remaskedAt'], 'an already clean cache is left alone'
+    print('PASS: resumed run re-masked with current rules, unchanged chunks keep notes, changed chunks re-read')
+
+
+def verify_scope_and_groups():
+    """Weekly full scan covers 7 days by default; groupScope "participated" skips groups I am not part of."""
+    with tempfile.TemporaryDirectory(prefix='todo-scope-') as tmp:
+        project = pathlib.Path(tmp); root = project / 'data'; runs = project / 'work/runs'
+        config = {'timeZone': 'Asia/Taipei', 'profile': 'fixture:person', 'earliestDate': '2026-10-01',
+                  'dataDirectory': str(root), 'selfOpenDingTalkId': 'fixture-self', 'groupScope': 'participated',
+                  'selfNames': ['演示本人'], 'skipConversations': ['公告群']}
+        followed = {'id': 'fixture-open', 'title': '等演示群回复', 'detail': '现状', 'category': 'waiting', 'priority': 1,
+                    'sources': [{'chat': '跟进群', 'time': '2026-10-19 09:00', 'quote': '请回复', 'messageId': 'm0', 'conversationId': 'open-group'}]}
+        inbox.merge(root, {'tasks': [followed]})
+        run = review.start(runs, config, root, '2026-10-20T09:00:00+08:00', True)['run']
+        state = review.read(runs / run / 'review.json')
+        assert state['start'] == '2026-10-13T09:00:00+08:00' and state['mode'] == 'full', state['start']
+        def group(cid, title, sender, content, single=False):
+            return {'openConversationId': cid, 'title': title, 'singleChat': single, 'messages': [
+                {'openConversationId': cid, 'openMessageId': cid + '-m', 'createTime': '2026-10-19 10:00:00',
+                 'sender': '演示同事', 'senderOpenDingTalkId': sender, 'content': content}]}
+        response = {'success': True, 'result': {'hasMore': False, 'conversationMessagesList': [
+            group('direct', '演示同事', 'fixture-person', '请看一下', single=True),
+            group('quiet', '闲聊群', 'fixture-person', '今天的午饭不错'),
+            group('mention', '项目群', 'fixture-person', '@演示本人 请处理报价'),
+            group('mine', '采购群', 'fixture-self', '我来跟进'),
+            group('everyone', '通知群', 'fixture-person', '@所有人 周五前提交'),
+            group('open-group', '跟进群', 'fixture-person', '已经回复了'),
+            group('announce', '公告群', 'fixture-self', '我发的公告')]}}
+        progress = review.ingest(runs, run, '0', response)
+        chunks = review.read(runs / run / 'chunks.json')
+        assert {c['conversationId'] for c in chunks} == {'direct', 'mention', 'mine', 'everyone', 'open-group'}, chunks
+        state = review.read(runs / run / 'review.json')
+        assert {g['conversationId'] for g in state['skippedConversations']} == {'quiet', 'announce'}
+        assert progress['skippedGroups'] == 2 and progress['messages'] == 7
+        assert review.skipped_note(state) == '按设置跳过2个未参与的群（共2条）；'
+        wide = review.start(runs.parent / 'other', {**config, 'fullScanDays': 30, 'groupScope': 'all', 'skipConversations': []},
+                            project / 'data2', '2026-10-20T09:00:00+08:00', True)
+        assert wide['start'] == '2026-10-01T00:00:00+08:00', wide['start']
+    print('PASS: 7-day weekly scan, configurable window, participated groups, @mentions, open-task groups, skip list')
+
+
+def verify_redaction_gaps():
+    """Shapes the first API-key fix still let through, and business text that must survive."""
+    leaks = {'密钥：Fx12-ab34-CD56-ef78': 'Fx12-ab34-CD56-ef78', '请用 token=fixtureABC123 登录': 'fixtureABC123',
+             'AKIAFIXTURE000000000 已配置': 'AKIAFIXTURE000000000',
+             '凭证 FxAb1234+CdEf5678/GhIj9012+KlMn3456== 已发': 'FxAb1234+CdEf5678',
+             '用 Fx7Kp2Lm9Qr4Ts6Vw8Za3Bc5 测试': 'Fx7Kp2Lm9Qr4Ts6Vw8Za3Bc5'}
+    for text, secret in leaks.items():
+        masked = review.safe_text(text)
+        assert secret not in masked and review.safe_text(masked) == masked, (text, masked)
+    for text in ['附件 2026年报-final-version-v2-revised-20261102.xlsx 看下', '订单 20261015-003 明天到',
+                 'iPhone15ProMax 测试机型', '放在 /Users/demo/Documents/Codex/work/runs 里']:
+        assert review.safe_text(text) == text, text
+    print('PASS: labeled short keys, AWS keys, base64 and 20+ mixed keys; file names and business text kept')
+
+
 if __name__ == '__main__':
+    verify_redaction_gaps()
+    verify_scope_and_groups()
+    verify_remask_on_resume()
     verify_api_redaction()
     verify_fixed_candidate()
     verify_utf8_cli()

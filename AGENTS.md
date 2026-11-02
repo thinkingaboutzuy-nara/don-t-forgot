@@ -51,6 +51,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
 3. **构建并重启**：运行 `python3 build_app.py`；如有旧的 `别忘了.app.previous`，确认无用后先删除。它会同时装到“应用程序”，若提示登录启动项仍指向别处，按提示改。然后运行 `launchctl kickstart -k gui/$(id -u)/local.vn.dingtalk-todo`。
    - 窗口尺寸只由面板自己决定（`NSHostingView.sizingOptions = []`），内容在列表里滚动；不要改回默认，否则内容会把窗口撑得比屏幕还高。
 4. **改整理规则**：直接改写 `整理规则.md` 的对应条目，不追加补丁段落；定时任务的 prompt 不需要动。
+   - 读取范围：每周一的完整回扫只往回 `fullScanDays` 天（默认 7）；`groupScope: "participated"` 时群聊只读我发过言、被 @（`selfNames`）或 @所有人、关联未完成事项、或列在 `keepConversations` 的群，`skipConversations` 永远跳过；跳过的群及条数记在本轮 `skippedConversations` 和整理摘要里。续接旧轮次时按最新遮蔽规则与群设置重整缓存（`remask`），未变的段落保留阅读记录。
    - 分页用 `fetch-command --run <run>` 生成的原生DWS命令，不手抄游标。判断写UTF-8 decisions.json，经 `stage --run <run> --input <文件>` 自动保留原字段/来源、按messageIndexes生成消息依据及方向、登记实际核对；`finish --run <run>` 从固定候选完成合并与同ID读回。不再写临时候选拼接脚本。事项现状用 `fields.detail` 整段改写（两句以内），不用 `appendDetail` 追加经过。JSON及CLI明确UTF-8，回归覆盖C/ASCII语系完整流程。
 5. **同步到两个远端**（用户要求每次修复都同步）：`git add -A && git commit`，再 `git push origin main && git push github main`。
    - `origin` 是内部 Gitea，`github` 是公开仓库 https://github.com/thinkingaboutzuy-nara/don-t-forgot ，地址见 `git remote -v`。
@@ -65,7 +66,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
 
 - 2026-10-21 已完成长期化改造：
   - 迁到本目录；源码统一为一份
-  - 定时任务改为每轮新开对话，并从每次全量回扫改为增量（每周一完整回扫）
+  - 定时任务改为每轮新开对话，并从每次全量回扫改为增量（每周一完整回扫，2026-11-02 起只回扫 7 天、只读相关的群）
   - 新增完成/忽略理由与完成动画、待确认分组（7 天无进展自动收起）、等回复天数、到期前 15 分钟通知、“交给 Codex”按钮、30 天封存
 - 已与日报平台连动：日报待办双向同步完成状态（事项上的 `reportTodo`，平台改动较晚时以平台为准）。浮窗底部原本的“整理日报”按钮已于 2026-10-28 移除，改为“整理记录”。
 - 2026-10-23 完成开发计划五项：稍后到点通知（可“完成”或“再推 1 小时”）、早上摘要、等回复满 3 天“催一下”与一次提醒、自己改期限（`dueOverride`）、ⓘ 里的通知开关与更新日志；点通知会定位到卡片。

@@ -124,6 +124,9 @@ def start(runs, config, root, end=None, full=False, session_id=None, expected_co
             path, state = load_run(runs, read(active)['run'])
             if state['phase'] != 'complete':
                 need(state['identity'] == identity, '未完成整理的账号或数据目录不同，不能接错任务')
+                # Redaction rules may have improved since this run cached its messages.
+                if remask(path, state):
+                    state['remaskedAt'] = stamp()
                 state['attempts'] += 1
                 state['lastStartedAt'] = stamp()
                 bind_completion(runs, state, config, now, session_id)
@@ -175,6 +178,10 @@ def safe_text(text):
     text = re.sub(r'''(?ix)((?<![A-Za-z0-9_])api[ _-]?key\s*[:=：]\s*["']?)[^\s"'`,;，；]+''',
                   r'\1[API凭证已移除]', text)
     text = re.sub(r'(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{12,}', '[API凭证已移除]', text)
+    # Shorter keys are still credentials when a label names them, and AWS access key IDs have a fixed shape.
+    text = re.sub(r'''(?ix)((?<![A-Za-z0-9_])(?:密钥|秘钥|令牌|token|access[ _-]?key|app[ _-]?key)\s*[:=：是为]\s*["']?)[^\s"'`,;，；]{8,}''',
+                  r'\1[API凭证已移除]', text)
+    text = re.sub(r'(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])', '[API凭证已移除]', text)
     text = re.sub(r'(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*[A-Za-z])(?=[A-Za-z0-9_.-]*\d)[A-Za-z0-9_.-]{32,}(?![A-Za-z0-9_.-])',
                   '[长凭证或裸标识已隐藏，按消息ID核对]', text)
     text = re.sub(r'[A-Za-z0-9_./+=:-]+\[(?:API凭证已移除|长凭证或裸标识已隐藏，按消息ID核对)\]',
@@ -189,6 +196,55 @@ def safe_text(text):
     text = re.sub(r'(?:https?://|dingtalk://)[^\s\]\)]+', '[链接]', text)
     text = re.sub(r'(?:mediaId|fileId|resourceId)\s*[:=]\s*[^\s\)]+', '[附件标识]', text)
     return text
+
+
+def clean_cached(m):
+    """Re-apply the current safe_text to an already normalized message (idempotent)."""
+    out = dict(m, content=safe_text(m.get('content', '')))
+    if m.get('quotedMessage'):
+        out['quotedMessage'] = clean_cached(m['quotedMessage'])
+    if m.get('forwardMessages'):
+        out['forwardMessages'] = [clean_cached(x) for x in m['forwardMessages']]
+    return out
+
+
+def remask(path, state):
+    """Bring a resumed run's cached pages, messages and chunks up to the current redaction rules.
+
+    Without this, a run cached before a redaction fix keeps showing the leaked text on every resume.
+    Reading notes are kept for chunks whose text is unchanged; changed chunks must be read again, and
+    a candidate built from the old text is discarded. Returns True when anything changed.
+    """
+    changed = False
+    for page in state['pages']:
+        data = read(path / page['file'])
+        need(digest(data) == page['sha'], '分页文件改变，停止覆盖审阅记录')
+        cleaned = dict(data, messages=[clean_cached(m) for m in data['messages']])
+        if cleaned != data:
+            save(path / page['file'], cleaned)
+            page['sha'] = digest(cleaned)
+            changed = True
+    pending = state.get('pendingPage')
+    if pending and pending.get('union'):
+        union = [clean_cached(m) for m in pending['union']]
+        if union != pending['union']:
+            pending['union'] = union
+            changed = True
+    if not changed or state['phase'] != 'review':
+        return changed
+    old = {(c['conversationId'], c['offset'], c['text']): c['id'] for c in read(path / 'chunks.json')}
+    reviewed = state['reviewed']
+    prepare(path, state)
+    kept = {}
+    for c in read(path / 'chunks.json'):
+        before = old.get((c['conversationId'], c['offset'], c['text']))
+        if before in reviewed:
+            kept[c['id']] = dict(reviewed[before], sha=c['sha'])
+    state['reviewed'] = kept
+    state['presented'] = {}
+    if state.pop('candidateHash', None) is not None:
+        (path / 'delta.json').unlink(missing_ok=True)
+    return True
 
 
 def normalize_message(m, group):

@@ -2,8 +2,8 @@
 """Validate and atomically merge an agent-produced task delta. Never edits actions.json.
 
 --dump     full inbox + actions
---open     compact view for a run: open tasks (with the user's own deadline, if set), user feedback, hand-offs,
-           pending report-platform ticks, sync
+--open     compact view for a run: open tasks (with the user's own deadline, if set), user feedback, hand-offs, sync.
+           DingTalk only: the daily-report platform is no longer read or written.
 --input    merge a delta; closed tasks older than --archive-days move to archive/
 """
 import argparse, datetime as dt, fcntl, json, os, pathlib, sys, tempfile
@@ -80,6 +80,13 @@ def platform_newer(task, action):
         return parse_aware(changed, 'reportTodo.changedAt') > parse_aware(action['updatedAt'], 'updatedAt')
     except DeltaError:
         return False
+
+
+def report_only(task):
+    """Came only from the retired daily-report platform (no DingTalk message behind it). Mirrors Todo.isReportOnly."""
+    sources = task.get('sources') or []
+    return bool(sources) and all(s.get('conversationType') == 'report' or str(s.get('conversationId', '')).startswith('report:')
+                                 for s in sources)
 
 
 def closed_at(task, action):
@@ -207,7 +214,7 @@ def merge(root, payload, archive_days=30, review_root=None):
         check(isinstance(delta_sync, dict), 'sync 必须是对象')
         sync = {**old.get('sync', {}), **delta_sync}
         # Match SyncInfo's optional strings before replacing a readable inbox.
-        for field in ['state', 'message', 'scannedThrough', 'scope', 'schedule', 'mode', 'runThreadId']:
+        for field in ['state', 'message', 'scannedThrough', 'scope', 'schedule', 'mode', 'runThreadId', 'failedRunId', 'failedRunThreadId']:
             check(sync.get(field) is None or isinstance(sync[field], str), f'sync.{field} 必须是字符串或 null')
         check(sync.get('state', 'ok') in ['ok', 'partial', 'error'], 'sync.state 无效')
         if sync.get('mode') is not None:
@@ -244,24 +251,19 @@ def open_view(root):
     inbox = read(root / 'inbox.json', {'tasks': [], 'sync': {}})
     actions = read(root / 'actions.json', {})
     now = utcnow()
-    open_tasks, feedback, handoffs, report_sync = [], [], [], []
+    open_tasks, feedback, handoffs = [], [], []
     for t in inbox['tasks']:
+        if report_only(t):
+            continue   # DingTalk only: the window hides these and runs no longer follow them up
         action = actions.get(t['id'])
         status = effective_status(t, action, now)
-        link = t.get('reportTodo')
-        # Push a manual tick/untick to the platform unless the platform changed it more recently.
-        if link and action and action.get('status') in ['done', 'active'] and not platform_newer(t, action):
-            want = action['status'] == 'done'
-            if want != link['done']:
-                report_sync.append({'id': t['id'], 'todoId': link['id'], 'expectedVersion': link['version'],
-                                    'done': want, 'at': action.get('updatedAt')})
         if status in ['active', 'snoozed']:
             row = {
                 'id': t['id'], 'title': t['title'], 'category': t['category'], 'priority': t['priority'],
                 'due': t.get('due'), 'status': status, 'needsConfirm': t.get('needsConfirm', t['title'].startswith('待确认')),
                 'lastEvidence': max((s['time'] for s in t['sources']), default=None),
                 'conversationIds': sorted({s['conversationId'] for s in t['sources']}),
-                'dispatch': t.get('dispatch'), 'reportTodo': t.get('reportTodo'),
+                'dispatch': t.get('dispatch'),
             }
             # The user's own deadline (TodoStore.due shows it first). Runs keep writing `due` from chat and never touch it.
             if action and action.get('dueOverride'):
@@ -274,7 +276,7 @@ def open_view(root):
             handoffs.append({'id': t['id'], 'title': t['title'], 'handoffAt': action['handoffAt']})
     feedback.sort(key=lambda f: f.get('at') or '', reverse=True)
     return {'sync': inbox.get('sync', {}), 'open': open_tasks, 'feedback': feedback[:40],
-            'handoffs': handoffs, 'reportSync': report_sync, 'archivedCount': len(inbox.get('archived', []))}
+            'handoffs': handoffs, 'archivedCount': len(inbox.get('archived', []))}
 
 
 def main():

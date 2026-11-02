@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 
 HERE = pathlib.Path(__file__).resolve().parent
 CHUNK_CHARS = 6000
-STAGES = ['formal_todos', 'codex', 'report', 'handoffs']
+STAGES = ['formal_todos', 'codex', 'handoffs']   # DingTalk only; the daily-report platform is no longer read
 
 
 class ReviewError(ValueError):
@@ -125,6 +125,10 @@ def start(runs, config, root, end=None, full=False, session_id=None, expected_co
             path, state = load_run(runs, read(active)['run'])
             if state['phase'] != 'complete':
                 need(state['identity'] == identity, '未完成整理的账号或数据目录不同，不能接错任务')
+                # Runs started before 2026-11-02 still list the retired daily-report check.
+                if 'report' in state['requiredChecks']:
+                    state['requiredChecks'] = [k for k in state['requiredChecks'] if k != 'report']
+                    state['checks'].pop('report', None)
                 # Redaction rules may have improved since this run cached its messages.
                 if remask(path, state, group_filter(config, read(path / 'open-at-start.json'))):
                     state['remaskedAt'] = stamp()
@@ -372,6 +376,13 @@ def remask(path, state, conversation_filter=None):
         changed = True
     if not changed or state['phase'] != 'review':
         return changed
+    rebuild(path, state)
+    return True
+
+
+def rebuild(path, state):
+    """Re-chunk from the saved pages after their text changed. Notes survive for chunks whose text is unchanged;
+    changed chunks must be read again, and a candidate built from the old text is discarded."""
     old = {(c['conversationId'], c['offset'], c['text']): c['id'] for c in read(path / 'chunks.json')}
     reviewed = state['reviewed']
     prepare(path, state)
@@ -384,7 +395,44 @@ def remask(path, state, conversation_filter=None):
     state['presented'] = {}
     if state.pop('candidateHash', None) is not None:
         (path / 'delta.json').unlink(missing_ok=True)
-    return True
+
+
+SENSITIVE_MASK = '[阅读时发现的敏感内容已隐藏，按消息ID核对]'
+
+
+def redact(runs, key, indexes):
+    """The reader found something the rules missed (a password, a key): hide those whole messages, including
+    quoted and forwarded parts, in every cache, and keep going instead of stopping the run. Only message IDs
+    are recorded, never the hidden text."""
+    need(isinstance(indexes, list) and indexes and all(type(i) is int for i in indexes), '指定要隐藏的消息编号')
+    def hide(m):
+        out = dict(m, content=SENSITIVE_MASK)
+        if m.get('quotedMessage'):
+            out['quotedMessage'] = hide(m['quotedMessage'])
+        if m.get('forwardMessages'):
+            out['forwardMessages'] = [hide(x) for x in m['forwardMessages']]
+        return out
+    with locked(runs):
+        path, state = load_run(runs, key)
+        need(state['phase'] == 'review', '分页完成后、审阅阶段才能隐藏消息')
+        rows = {m['index']: m for m in read(path / 'messages.json')}
+        need(all(i in rows for i in indexes), '消息编号不在本轮')
+        targets = {(rows[i]['openConversationId'], rows[i]['openMessageId']) for i in indexes}
+        for page in state['pages']:
+            data = read(path / page['file'])
+            need(digest(data) == page['sha'], '分页文件改变，停止覆盖审阅记录')
+            hidden = [hide(m) if (m['openConversationId'], m['openMessageId']) in targets else m for m in data['messages']]
+            if hidden != data['messages']:
+                page.setdefault('fetchedSha', page['sha'])
+                data = dict(data, messages=hidden)
+                save(path / page['file'], data)
+                page['sha'] = digest(data)
+        rebuild(path, state)
+        state['redacted'] = sorted(set(state.get('redacted', [])) | {f'{c}/{m}' for c, m in targets})
+        state['lastProgressAt'] = stamp()
+        save(path / 'review.json', state)
+        reread = [c['id'] for c in state['chunks'] if c['id'] not in state['reviewed']]
+        return {**progress(state), 'hiddenMessages': len(targets), 'reread': reread}
 
 
 def normalize_message(m, group):
@@ -738,7 +786,8 @@ def record_failure(runs, key, reason, evidence=None, expected_session=None, expe
         state['lastError'] = {'at': stamp(), 'reason': reason, 'phase': state['phase']}
         state['stopBlocker'] = blocker
         save(path / 'review.json', state)
-        sync = {'state': 'partial', 'mode': state['mode'],
+        sync = {'state': 'partial', 'mode': state['mode'], 'failedRunId': key,
+                'failedRunThreadId': state.get('completionSessionId') or '',
                 'scope': f"{state['start']} 至 {state['end']}；已保存{len(state['pages'])}页，已审阅{len(state['reviewed'])}/{len(state['chunks'])}段；进度保留。",
                 'message': f"整理未完成：{reason}；下次从原进度继续。"}
         merge(pathlib.Path(state['root']), {'tasks': [], 'sync': sync})
@@ -769,7 +818,7 @@ def finish(runs, key, payload, message):
         else:
             skipped = [v['note'] for v in state['checks'].values() if v.get('skipped')]
             sync = {**payload.get('sync', {}), 'state': 'ok', 'mode': state['mode'],
-                    'scannedThrough': state['end'], 'reviewRunId': key,
+                    'scannedThrough': state['end'], 'reviewRunId': key, 'failedRunId': None, 'failedRunThreadId': None,
                     'scope': f"{state['start']} 至 {state['end']}；{len(state['pages'])}页、{state.get('messageCount', 0)}条、{state.get('conversationCount', 0)}个会话；{len(state['chunks'])}段全文及全部必需核对已完成；" + skipped_note(state) + "图片、语音、文件仅按影响结论的需要解析。",
                     'message': message + ('；日报同步跳过：' + '；'.join(skipped) if skipped else '')}
             validate_ready(runs, key, sync, old.get('sync', {}))
@@ -825,7 +874,7 @@ def main():
     parser.add_argument('--project', type=pathlib.Path, default=HERE)
     sub = parser.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('start'); p.add_argument('--end'); p.add_argument('--full', action='store_true')
-    for cmd in ['status', 'fetch-command', 'ingest', 'next', 'ack', 'check', 'stage', 'finish', 'fail']:
+    for cmd in ['status', 'fetch-command', 'ingest', 'next', 'ack', 'check', 'stage', 'finish', 'fail', 'redact']:
         p = sub.add_parser(cmd); p.add_argument('--run', required=True)
         if cmd == 'ingest': p.add_argument('--cursor', required=True)
         if cmd == 'next': p.add_argument('--count', type=int, default=1)
@@ -833,6 +882,7 @@ def main():
         if cmd == 'check':
             p.add_argument('--key', required=True); p.add_argument('--note', required=True); p.add_argument('--skipped', action='store_true')
         if cmd == 'finish': p.add_argument('--message')
+        if cmd == 'redact': p.add_argument('--index', type=int, action='append', required=True)
         if cmd == 'fail':
             p.add_argument('--reason', required=True)
             p.add_argument('--evidence', type=pathlib.Path)
@@ -848,6 +898,7 @@ def main():
         elif args.cmd == 'ack': value = acknowledge(runs, args.run, read(args.input))
         elif args.cmd == 'check': value = check_stage(runs, args.run, args.key, args.note, args.skipped)
         elif args.cmd == 'stage': value = stage_candidate(runs, args.run, read(args.input), read(args.project / 'config.json'))
+        elif args.cmd == 'redact': value = redact(runs, args.run, args.index)
         elif args.cmd == 'fail':
             state = load_run(runs, args.run)[1]
             caller = os.environ.get('CODEX_THREAD_ID') if state.get('completionSessionId') else None

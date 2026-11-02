@@ -32,7 +32,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
   - 窗口偏好设置（`defaults read local.vn.dingtalk-todo`）：`mutedNotifications`（ⓘ 里关掉的通知）、`summaryShownDay`（早上摘要已处理的日期）、`changelogSeen`（ⓘ 小圆点）、`seenThrough`（“新”标记）
   - `archive/`：收起超过 30 天的事项
 - 登录启动：`~/Library/LaunchAgents/local.vn.dingtalk-todo.plist`，Label 与 bundle ID 都是 `local.vn.dingtalk-todo`。设为 `KeepAlive.SuccessfulExit=false`：异常退出会被拉起，用户从菜单退出则不会。
-- 日报平台：经 Codex 已登记的 `work-reports` MCP（本机转接程序 `工作日報自動化/var/report-mcp-production-candidate-20261020/mcp_client.py`）读写本人待办。`~/.codex/config.toml` 只对 `get_todos`、`set_todo_done` 设了 `approval_mode = "approve"`，让定时整理无人值守也能同步；存草稿、提交仍需核准。平台端的 `set_todo_done` 于 2026-10-21 发布，记录在 `工作日報自動化/evidence/20261021-别忘了待办同步/`。
+- 日报平台（2026-11-02 起停用，只看钉钉；以下为历史记录）：经 Codex 已登记的 `work-reports` MCP（本机转接程序 `工作日報自動化/var/report-mcp-production-candidate-20261020/mcp_client.py`）读写本人待办。`~/.codex/config.toml` 只对 `get_todos`、`set_todo_done` 设了 `approval_mode = "approve"`，让定时整理无人值守也能同步；存草稿、提交仍需核准。平台端的 `set_todo_done` 于 2026-10-21 发布，记录在 `工作日報自動化/evidence/20261021-别忘了待办同步/`。
 - 定时任务：`~/.codex/automations/automation-8/automation.toml`，`kind = "cron"`、`auto_archive = true`、模型 `gpt-6.1-sol`，每轮新开对话执行，prompt 指向 `整理规则.md`并要求start绑定、按完成凭据结束。`requireAutoCompletion=true`与受信任的本机Codex Stop hook配合，不能只抓取就收尾。旧的承载对话 `01a15832-…` 已不再接收定时任务。
 
 ## 技能包与源码
@@ -52,6 +52,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
    - 窗口尺寸只由面板自己决定（`NSHostingView.sizingOptions = []`），内容在列表里滚动；不要改回默认，否则内容会把窗口撑得比屏幕还高。
 4. **改整理规则**：直接改写 `整理规则.md` 的对应条目，不追加补丁段落；定时任务的 prompt 不需要动。
    - 读取范围：每周一的完整回扫只往回 `fullScanDays` 天（默认 7）；`groupScope: "participated"` 时群聊只读我发过言、被 @（`selfNames`）或 @所有人、关联未完成事项、或列在 `keepConversations` 的群，`skipConversations` 永远跳过；跳过的群及条数记在本轮 `skippedConversations` 和整理摘要里。续接旧轮次时按最新遮蔽规则与群设置重整缓存（`remask`），未变的段落保留阅读记录。
+   - 阅读时发现规则漏遮的敏感内容，用 `redact --run <run> --index N` 整条隐藏并继续，不要停下整轮；只记录消息 ID。整理失败时 `inbox.sync` 写 `failedRunId`/`failedRunThreadId`，浮窗“打开整理对话”在失败时指向出错的那一轮，成功后清空。浮窗读清单时某一件格式有误只跳过那一件并提示，其他照常显示。
    - 遮蔽分两层：`safe_text` 按单条消息处理已知格式；`mask_sequence`/`mask_message` 按上下文处理没有标签的登录材料（同一发送人 10 分钟内相邻的账号+短密码、同条消息、引用/转发、登录提示后的短串），读入、跨页、续接重整都会执行。`next` 输出前与来源引用生成前再用 `leaked_login` 检查，仍有疑似登录材料就报错停止，不带出原值。单独的邮箱或短串不遮。
    - 分页用 `fetch-command --run <run>` 生成的原生DWS命令，不手抄游标。判断写UTF-8 decisions.json，经 `stage --run <run> --input <文件>` 自动保留原字段/来源、按messageIndexes生成消息依据及方向、登记实际核对；`finish --run <run>` 从固定候选完成合并与同ID读回。不再写临时候选拼接脚本。事项现状用 `fields.detail` 整段改写（两句以内），不用 `appendDetail` 追加经过。JSON及CLI明确UTF-8，回归覆盖C/ASCII语系完整流程。
 5. **同步到两个远端**（用户要求每次修复都同步）：`git add -A && git commit`，再 `git push origin main && git push github main`。
@@ -69,7 +70,7 @@ Mac 原生悬浮窗，显示从钉钉聊天整理出的个人待办；Codex 每�
   - 迁到本目录；源码统一为一份
   - 定时任务改为每轮新开对话，并从每次全量回扫改为增量（每周一完整回扫，2026-11-02 起只回扫 7 天、只读相关的群）
   - 新增完成/忽略理由与完成动画、待确认分组（7 天无进展自动收起）、等回复天数、到期前 15 分钟通知、“交给 Codex”按钮、30 天封存
-- 已与日报平台连动：日报待办双向同步完成状态（事项上的 `reportTodo`，平台改动较晚时以平台为准）。浮窗底部原本的“整理日报”按钮已于 2026-10-28 移除，改为“整理记录”。
+- 2026-11-02 起只看钉钉：不再读写日报平台；只来自日报平台的事项（来源都是 `report`）浮窗不显示、`--open` 不列出、必需核对不再有 `report`。旧数据里的 `reportTodo` 字段保留兼容。浮窗底部原本的“整理日报”按钮已于 2026-10-28 移除，改为“整理记录”。
 - 2026-10-23 完成开发计划五项：稍后到点通知（可“完成”或“再推 1 小时”）、早上摘要、等回复满 3 天“催一下”与一次提醒、自己改期限（`dueOverride`）、ⓘ 里的通知开关与更新日志；点通知会定位到卡片。
 - 自动派发已停用，改为浮窗按钮由用户发起。此前已派发的事项（Holy蟹 `dingtalk-todo-58113415434` 等）保留 `dispatch` 字段，整理时继续核对其进度。
 - 旧路径 `Codex/2026-10-20/i-ll-start-by-loading-the/outputs/钉钉待办` 是指向本目录的链接，旧对话里的引用仍可打开。

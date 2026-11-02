@@ -291,8 +291,22 @@ CHECKS = r'''
         let log = parseChangelog("# 更新日志\n\n说明文字\n\n## 2026-10-23\n- 稍后到点会弹窗\n  并可再推 1 小时\n- 可以自己改期限\n\n## 2026-10-21\n* 首版\n")
         expect(log.map(\.title) == ["2026-10-23", "2026-10-21"] && log[0].items == ["稍后到点会弹窗并可再推 1 小时", "可以自己改期限"] && log[1].items == ["首版"], "changelog parse \(log)")
         expect(parseChangelog("").isEmpty && parseChangelog("没有标题\n- 孤立条目").isEmpty, "no changelog is fine")
+        // One malformed item no longer hides the whole list; report-only items are not shown
+        let json = """
+        {"schemaVersion":1,"updatedAt":null,"tasks":[
+          {"id":"ok","title":"正常事项","detail":"","category":"action","priority":1,"sources":[{"chat":"c","time":"2026-11-01 10:00","quote":"q","messageId":"m","conversationId":"c"}]},
+          {"id":"bad","title":"坏事项","detail":"","category":"action","priority":1,"due":false,"sources":[]},
+          {"id":"report","title":"日报待办","detail":"","category":"action","priority":1,"sources":[{"chat":"工作汇报","time":"2026-11-01","quote":"q","messageId":"todo:t","conversationId":"report:x","conversationType":"report"}]}
+        ],"sync":{"state":"partial","runThreadId":"good-thread","failedRunId":"r2","failedRunThreadId":"failed-thread"}}
+        """
+        let lossy = try JSONDecoder().decode(Inbox.self, from: Data(json.utf8))
+        expect(lossy.tasks.map(\.id) == ["ok"] && lossy.unreadable == 1, "lossy decode \(lossy.tasks.map(\.id)) \(lossy.unreadable)")
+        store.inbox = lossy
+        expect(store.runURL?.absoluteString == "codex://threads/failed-thread", "failed run opens its own thread")
+        store.inbox.sync?.state = "ok"
+        expect(store.runURL?.absoluteString == "codex://threads/good-thread", "after success the last run's thread")
         if failed > 0 { exit(1) }
-        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link, newest update, run record, copied messages, archive search, new badge, own deadline, snooze/due notices, morning summary, nudge, focus, changelog")
+        print("PASS: state, groups, reasons, undo, snooze, late runs, hand-off link, report link, newest update, run record, copied messages, archive search, new badge, lossy decode, report-only hidden, failed-run link, own deadline, snooze/due notices, morning summary, nudge, focus, changelog")
     }
 }
 '''

@@ -232,6 +232,7 @@ def verify():
         review.record_failure(runs, run, '合成网络故障，服务恢复后继续剩余审阅。')
         assert (path / 'pages').exists() and (path / 'chunks.json').exists()
         assert review.read(root / 'inbox.json')['sync']['scannedThrough'] == '2026-10-20T08:00:00+08:00'
+        assert review.read(root / 'inbox.json')['sync']['failedRunId'] == run, 'the failure points at the failing run'
         resumed = review.start(runs, config, root)
         assert resumed['reviewed'] == 1
         rejects(lambda: review.finish(runs, run, {}, '未审阅完'), 'review incomplete')
@@ -261,6 +262,7 @@ def verify():
         assert result['recovered'] and review.load_run(runs, run)[1]['phase'] == 'complete'
         assert not (path / 'pages').exists() and not (path / 'messages.json').exists()
         assert review.read(root / 'inbox.json')['sync']['scannedThrough'] == '2026-10-20T09:00:00+08:00'
+        assert review.read(root / 'inbox.json')['sync']['failedRunId'] is None, 'success clears the failure pointer'
         assert (root / 'actions.json').read_bytes() == manual
         rejects(lambda: review.finish(runs, run, {'tasks': []}, '另一份增量'), 'replay altered payload')
         followup = review.start(runs, config, root, '2026-10-20T10:00:00+08:00')
@@ -500,7 +502,46 @@ def verify_login_pairs():
     print('PASS: login pairs in one message, across messages and pages, quoted/forwarded, after a login cue; old cache blocked then cleaned; business text kept')
 
 
+def verify_redact_and_dingtalk_only():
+    """A reader can hide a message the rules missed and keep going; runs no longer include the daily-report check."""
+    hidden = 'HiddenPw9x'   # synthetic value the rules let through on its own
+    with tempfile.TemporaryDirectory(prefix='todo-redact-') as tmp:
+        project = pathlib.Path(tmp); root = project / 'data'; runs = project / 'work/runs'
+        config = {'timeZone': 'Asia/Taipei', 'profile': 'fixture:person', 'earliestDate': '2026-10-01',
+                  'dataDirectory': str(root), 'selfOpenDingTalkId': 'fixture-self'}
+        run = review.start(runs, config, root, '2026-11-01T14:00:00+08:00')['run']
+        state = review.read(runs / run / 'review.json')
+        assert 'report' not in state['requiredChecks'], state['requiredChecks']
+        def chat(cid, content):
+            return {'openConversationId': cid, 'title': cid, 'singleChat': True, 'messages': [
+                {'openConversationId': cid, 'openMessageId': cid + '-m', 'createTime': '2026-11-01 10:00:00',
+                 'sender': '演示同事', 'senderOpenDingTalkId': 'fixture-person', 'content': content,
+                 'forwardMessages': [{'openMessageId': cid + '-f', 'createTime': '2026-11-01 09:59:00', 'sender': '演示同事',
+                                      'senderOpenDingTalkId': 'fixture-person', 'content': '转发里也有 ' + hidden}] if cid == 'b-chat' else []}]}
+        review.ingest(runs, run, '0', {'success': True, 'result': {'hasMore': False, 'nextCursor': '',
+                      'conversationMessagesList': [chat('a-chat', '请核对演示事项。'), chat('b-chat', '新的密钥是 ' + hidden)]}})
+        first = review.next_chunks(runs, run)['chunks']
+        review.acknowledge(runs, run, [{'id': c['id'], 'sha': c['sha'], 'note': '已阅读合成的普通消息。'} for c in first])
+        rejects(lambda: review.redact(runs, run, [99]), 'unknown index')
+        index = next(m['index'] for m in review.read(runs / run / 'messages.json') if m['openConversationId'] == 'b-chat')
+        result = review.redact(runs, run, [index])
+        assert result['hiddenMessages'] == 1 and len(result['reread']) == 1
+        for f in [*(runs / run / 'pages').glob('*.json'), runs / run / 'messages.json', runs / run / 'chunks.json', runs / run / 'review.json']:
+            assert hidden not in f.read_text(encoding='utf-8'), f.name
+        state = review.read(runs / run / 'review.json')
+        assert state['redacted'] == ['b-chat/b-chat-m'] and [c['id'] for c in first] == list(state['reviewed'])
+        shown = review.next_chunks(runs, run)['chunks']
+        assert shown[0]['conversationId'] == 'b-chat' and review.SENSITIVE_MASK in shown[0]['text']
+        # A run started before the change still lists the daily-report check; resuming drops it.
+        state['requiredChecks'].append('report'); review.save(runs / run / 'review.json', state)
+        review.start(runs, config, root, '2026-11-01T14:30:00+08:00')
+        assert 'report' not in review.read(runs / run / 'review.json')['requiredChecks']
+        rejects(lambda: review.check_stage(runs, run, 'report', '日报服务已停用，不再核对。', True), 'retired check')
+    print('PASS: redact hides a missed secret everywhere and keeps other notes; daily-report check retired')
+
+
 if __name__ == '__main__':
+    verify_redact_and_dingtalk_only()
     verify_login_pairs()
     verify_redaction_gaps()
     verify_scope_and_groups()

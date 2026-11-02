@@ -7,7 +7,9 @@ python3 tests/ui_snapshot.py --data <dir with inbox.json/actions.json> --out <di
 Steps: snap,<name> | click,<x>,<y from top, points> | key,<text> or key,cmd<char> (e.g. cmdf, cmd=) | wait,<seconds>
      | notify,<open|complete|snooze-1h>,<task id> (as if that notification, or its button, was clicked)
      | menudump,<x>,<y> (print the right-click menu at that point, without opening it)
-     | menu,<title>/<title>… (choose that item in the last dumped menu).
+     | menu,<title>/<title>… (choose that item in the last dumped menu)
+     | pref,<key>,<value> (write a preference, as if the window changed it) | height,<points> (resize the window, as a drag would)
+     | frame,<label> (print the window size, the content's intrinsic and fitting size, and the screen's visible size).
 snap also saves other visible windows, such as the ⓘ popover, as <name>-window<N>.png.
 The data dir is used as-is, so pass a copy or tests/ui_fixture.py output, never the live data directory.
 """
@@ -67,6 +69,14 @@ var lastMenu: NSMenu?
         else if let sub = menu.items[index].submenu { menu = sub }
     }
 }
+@MainActor func frame(_ d: AppDelegate, _ label: String) {
+    let content = d.panel.contentView
+    let screen = (d.panel.screen ?? NSScreen.main)?.visibleFrame.size ?? .zero
+    print("FRAME \(label): window=\(Int(d.panel.frame.width))x\(Int(d.panel.frame.height))"
+          + " intrinsic=\(content.map { "\(Int($0.intrinsicContentSize.width))x\(Int($0.intrinsicContentSize.height))" } ?? "-")"
+          + " fitting=\(content.map { "\(Int($0.fittingSize.width))x\(Int($0.fittingSize.height))" } ?? "-")"
+          + " visible=\(Int(screen.width))x\(Int(screen.height))")
+}
 @MainActor func key(_ d: AppDelegate, _ text: String) {
     d.panel.makeKey()
     let command = text.hasPrefix("cmd") && text.count == 4
@@ -92,6 +102,12 @@ var lastMenu: NSMenu?
             }
             case "menudump": DispatchQueue.main.asyncAfter(deadline: .now() + t) { menuDump(d, CGFloat(Double(parts[1])!), CGFloat(Double(parts[2])!)) }
             case "menu": DispatchQueue.main.asyncAfter(deadline: .now() + t) { chooseMenu(parts[1...].joined(separator: ",")) }
+            case "frame": DispatchQueue.main.asyncAfter(deadline: .now() + t) { frame(d, parts[1]) }
+            case "pref": DispatchQueue.main.asyncAfter(deadline: .now() + t) { UserDefaults.standard.set(parts[2], forKey: parts[1]) }
+            case "height": DispatchQueue.main.asyncAfter(deadline: .now() + t) {
+                let f = d.panel.frame, h = CGFloat(Double(parts[1])!)
+                d.panel.setFrame(NSRect(x: f.minX, y: f.maxY - h, width: f.width, height: h), display: true)
+            }
             case "wait": t += Double(parts[1])!
             default: break
             }

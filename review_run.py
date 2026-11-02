@@ -80,6 +80,7 @@ def progress(state):
             'mode': state['mode'], 'cursor': state['cursor'], 'pages': len(state['pages']),
             'messages': state.get('messageCount', 0), 'conversations': state.get('conversationCount', 0),
             'reviewed': len(state['reviewed']), 'chunks': len(state['chunks']),
+            'skippedGroups': len(state.get('skippedConversations', [])),
             'remainingChecks': [k for k in state['requiredChecks'] if k not in state['checks']],
             'lastProgressAt': state['lastProgressAt'], 'attempts': state['attempts'],
             'lastError': state.get('lastError'),
@@ -125,7 +126,7 @@ def start(runs, config, root, end=None, full=False, session_id=None, expected_co
             if state['phase'] != 'complete':
                 need(state['identity'] == identity, '未完成整理的账号或数据目录不同，不能接错任务')
                 # Redaction rules may have improved since this run cached its messages.
-                if remask(path, state):
+                if remask(path, state, group_filter(config, read(path / 'open-at-start.json'))):
                     state['remaskedAt'] = stamp()
                 state['attempts'] += 1
                 state['lastStartedAt'] = stamp()
@@ -140,7 +141,10 @@ def start(runs, config, root, end=None, full=False, session_id=None, expected_co
         monday = end - dt.timedelta(days=end.weekday())
         monday = monday.replace(hour=0, minute=0, second=0)
         full = full or last is None or last_full is None or end - last_full > dt.timedelta(days=7) or (end.weekday() == 0 and end.hour >= 9 and last_full < monday)
-        begin = max(earliest, end - dt.timedelta(days=30)) if full else max(earliest, last - dt.timedelta(minutes=15))
+        # The weekly full scan only re-checks the past week: daily runs already read everything once, and pages
+        # are verified by re-reading, so going further back mostly re-reads the same messages.
+        days = int(config.get('fullScanDays', 7))
+        begin = max(earliest, end - dt.timedelta(days=days)) if full else max(earliest, last - dt.timedelta(minutes=15))
         need(begin <= end, '扫描起止时间倒置')
         key_time = now
         key = key_time.strftime('%Y%m%d-%H%M%S')
@@ -157,12 +161,21 @@ def start(runs, config, root, end=None, full=False, session_id=None, expected_co
                  'chunks': [], 'reviewed': {}, 'presented': {}, 'checks': {},
                  'requiredChecks': STAGES + ['task:' + t['id'] for t in view['open']],
                  'attempts': 1, 'lastProgressAt': stamp(), 'createdAt': stamp(),
-                 'verifyMessagePages': config.get('verifyMessagePages', False)}
+                 'verifyMessagePages': config.get('verifyMessagePages', False),
+                 'groupFilter': group_filter(config, view)}
         save(path / 'open-at-start.json', view)
         bind_completion(runs, state, config, now, session_id)
         save(path / 'review.json', state)
         save(active, {'run': key})
         return progress(state)
+
+
+FILE_NAME = re.compile(r'\.(?:xlsx?|docx?|pptx?|pdf|png|jpe?g|gif|zip|rar|csv|txt|md|mp4|mov)$', re.I)
+
+
+def keep_file_names(match):
+    """Long attachment names look like keys but are business context; keep them."""
+    return match.group(0) if FILE_NAME.search(match.group(0)) else '[长凭证或裸标识已隐藏，按消息ID核对]'
 
 
 def safe_text(text):
@@ -183,7 +196,10 @@ def safe_text(text):
                   r'\1[API凭证已移除]', text)
     text = re.sub(r'(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])', '[API凭证已移除]', text)
     text = re.sub(r'(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*[A-Za-z])(?=[A-Za-z0-9_.-]*\d)[A-Za-z0-9_.-]{32,}(?![A-Za-z0-9_.-])',
-                  '[长凭证或裸标识已隐藏，按消息ID核对]', text)
+                  keep_file_names, text)
+    # Shorter unlabeled keys and base64 secrets mix upper case, lower case and digits, often with + / =.
+    text = re.sub(r'(?<![A-Za-z0-9_+/=-])(?=[A-Za-z0-9_+/-]*[A-Z])(?=[A-Za-z0-9_+/-]*[a-z])(?=[A-Za-z0-9_+/-]*\d)'
+                  r'[A-Za-z0-9_+/-]{20,}={0,2}(?![A-Za-z0-9_+/=-])', keep_file_names, text)
     text = re.sub(r'[A-Za-z0-9_./+=:-]+\[(?:API凭证已移除|长凭证或裸标识已隐藏，按消息ID核对)\]',
                   '[API凭证已移除]', text)
     text = re.sub(r'\[(?:API凭证已移除|长凭证或裸标识已隐藏，按消息ID核对)\][A-Za-z0-9_./+=:-]+',
@@ -208,7 +224,7 @@ def clean_cached(m):
     return out
 
 
-def remask(path, state):
+def remask(path, state, conversation_filter=None):
     """Bring a resumed run's cached pages, messages and chunks up to the current redaction rules.
 
     Without this, a run cached before a redaction fix keeps showing the leaked text on every resume.
@@ -230,6 +246,9 @@ def remask(path, state):
         if union != pending['union']:
             pending['union'] = union
             changed = True
+    if conversation_filter is not None and conversation_filter != state.get('groupFilter'):
+        state['groupFilter'] = conversation_filter
+        changed = True
     if not changed or state['phase'] != 'review':
         return changed
     old = {(c['conversationId'], c['offset'], c['text']): c['id'] for c in read(path / 'chunks.json')}
@@ -272,6 +291,33 @@ def message_body(m):
     return body
 
 
+def group_filter(config, view):
+    """Which conversations a run reads. groupScope "participated" keeps a group only when I wrote in it,
+    someone @-mentioned me (selfNames) or @所有人, it belongs to an open task, or it is in keepConversations.
+    skipConversations (title or conversation ID) are never read. Direct chats are always read."""
+    mode = config.get('groupScope', 'all')
+    need(mode in ['all', 'participated'], 'groupScope 只能是 all 或 participated')
+    return {'mode': mode, 'selfId': config.get('selfOpenDingTalkId', ''),
+            'names': [n for n in config.get('selfNames', []) if isinstance(n, str) and n],
+            'keep': list(config.get('keepConversations', [])), 'skip': list(config.get('skipConversations', [])),
+            'open': sorted({cid for t in view.get('open', []) for cid in t.get('conversationIds', [])})}
+
+
+def keep_conversation(cid, title, items, f):
+    if not f:
+        return True
+    if cid in f['skip'] or title in f['skip']:
+        return False
+    if f['mode'] != 'participated' or items[0].get('singleChat') is not False:
+        return True
+    if cid in f['keep'] or title in f['keep'] or cid in f['open']:
+        return True
+    if any(m.get('senderOpenDingTalkId') == f['selfId'] for m in items):
+        return True
+    marks = ['@' + n for n in f['names']] + ['@所有人', '@all', '@All']
+    return any(mark in message_body(m) for m in items for mark in marks)
+
+
 def prepare(path, state):
     rows = {}
     for page in state['pages']:
@@ -287,21 +333,24 @@ def prepare(path, state):
     for index, m in enumerate(messages, 1):
         m['index'] = index
         groups[m['openConversationId']].append(m)
-    chunks = []
+    chunks, skipped = [], []
     for cid, items in sorted(groups.items()):
+        title = next((m['chatTitle'] for m in reversed(items) if m['chatTitle']), '')
+        if not keep_conversation(cid, title, items, state.get('groupFilter')):
+            skipped.append({'conversationId': cid, 'title': title, 'messages': len(items)})
+            continue
         lines = ''.join(f"[{m['index']}] {m['createTime']} {m['sender']}: {message_body(m)}\n" for m in items)
         # Every character is covered, including an unusually long single message.
         for offset in range(0, len(lines), CHUNK_CHARS):
             text = lines[offset:offset + CHUNK_CHARS]
             chunk = {'id': f'chunk-{len(chunks) + 1:04}', 'conversationId': cid,
-                     'title': next((m['chatTitle'] for m in reversed(items) if m['chatTitle']), ''),
-                     'offset': offset, 'text': text}
+                     'title': title, 'offset': offset, 'text': text}
             chunk['sha'] = digest(chunk)
             chunks.append(chunk)
     save(path / 'messages.json', messages)
     save(path / 'chunks.json', chunks)
     state.update(chunks=[{'id': c['id'], 'sha': c['sha']} for c in chunks], phase='review',
-                 messageCount=len(messages), conversationCount=len(groups))
+                 messageCount=len(messages), conversationCount=len(groups), skippedConversations=skipped)
 
 
 def ingest(runs, key, cursor, response):
@@ -559,6 +608,13 @@ def record_failure(runs, key, reason, evidence=None, expected_session=None, expe
         return progress(state)
 
 
+def skipped_note(state):
+    skipped = state.get('skippedConversations', [])
+    if not skipped:
+        return ''
+    return f"按设置跳过{len(skipped)}个未参与的群（共{sum(s['messages'] for s in skipped)}条）；"
+
+
 def finish(runs, key, payload, message):
     from update_inbox import merge
     with locked(runs):
@@ -577,7 +633,7 @@ def finish(runs, key, payload, message):
             skipped = [v['note'] for v in state['checks'].values() if v.get('skipped')]
             sync = {**payload.get('sync', {}), 'state': 'ok', 'mode': state['mode'],
                     'scannedThrough': state['end'], 'reviewRunId': key,
-                    'scope': f"{state['start']} 至 {state['end']}；{len(state['pages'])}页、{state.get('messageCount', 0)}条、{state.get('conversationCount', 0)}个会话；{len(state['chunks'])}段全文及全部必需核对已完成；图片、语音、文件仅按影响结论的需要解析。",
+                    'scope': f"{state['start']} 至 {state['end']}；{len(state['pages'])}页、{state.get('messageCount', 0)}条、{state.get('conversationCount', 0)}个会话；{len(state['chunks'])}段全文及全部必需核对已完成；" + skipped_note(state) + "图片、语音、文件仅按影响结论的需要解析。",
                     'message': message + ('；日报同步跳过：' + '；'.join(skipped) if skipped else '')}
             validate_ready(runs, key, sync, old.get('sync', {}))
             state['preparedPayloadHash'] = original_hash

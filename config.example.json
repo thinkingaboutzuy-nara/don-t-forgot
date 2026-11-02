@@ -13,5 +13,10 @@
   "selfOpenDingTalkId": "<本人 openDingTalkId>",
   "requireReviewReceipt": true,
   "verifyMessagePages": true,
-  "requireAutoCompletion": false
+  "requireAutoCompletion": false,
+  "fullScanDays": 7,
+  "groupScope": "participated",
+  "selfNames": ["<你在钉钉里的名字，用于识别 @我>"],
+  "keepConversations": [],
+  "skipConversations": []
 }
